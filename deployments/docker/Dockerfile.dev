@@ -1,0 +1,46 @@
+ARG GO_IMAGE=golang@sha256:154bd7001b6eb339e88c964442c0ad6ed5e53f09844cc818a41ce4ecb3ce3b43
+FROM ${GO_IMAGE}
+
+ARG NODE_VERSION=25.9.0
+ARG PNPM_VERSION=11.7.0
+ARG TARGETARCH
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    make \
+    openssh-client \
+    postgresql-client \
+    xz-utils \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN case "${TARGETARCH:-arm64}" in \
+      amd64) node_arch="x64" ;; \
+      arm64) node_arch="arm64" ;; \
+      *) echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+  && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz" -o /tmp/node.tar.xz \
+  && mkdir -p /usr/local/lib/nodejs \
+  && tar -xJf /tmp/node.tar.xz -C /usr/local/lib/nodejs --strip-components=1 \
+  && ln -sf /usr/local/lib/nodejs/bin/node /usr/local/bin/node \
+  && ln -sf /usr/local/lib/nodejs/bin/npm /usr/local/bin/npm \
+  && ln -sf /usr/local/lib/nodejs/bin/npx /usr/local/bin/npx \
+  && rm /tmp/node.tar.xz
+
+RUN npm install -g "pnpm@${PNPM_VERSION}" \
+  && ln -sf /usr/local/lib/nodejs/bin/pnpm /usr/local/bin/pnpm
+
+WORKDIR /workspace
+
+ENV GOMODCACHE=/go/pkg/mod \
+    GOCACHE=/root/.cache/go-build \
+    PNPM_HOME=/root/.local/share/pnpm \
+    PATH=/root/.local/share/pnpm:/usr/local/go/bin:/usr/local/bin:/usr/local/lib/nodejs/bin:$PATH
+
+CMD ["bash"]

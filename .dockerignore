@@ -1,0 +1,17 @@
+.git
+.DS_Store
+.cache
+.tmp
+node_modules
+apps/web/node_modules
+apps/web/dist
+.data
+.runs
+.worktrees
+.repos
+demo-service.git
+/api
+/mcp-gateway
+/mcxctl
+/worker-agentd
+*.log

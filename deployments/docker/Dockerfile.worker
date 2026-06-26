@@ -1,0 +1,25 @@
+FROM node:25.9.0-bookworm-slim
+
+ARG CODEX_CLI_VERSION=0.142.2
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    curl \
+    git \
+    jq \
+    openssh-client \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g "@openai/codex@${CODEX_CLI_VERSION}" \
+  && npm cache clean --force \
+  && codex --version
+
+RUN useradd -m -u 10001 codex
+COPY deployments/docker/worker-entrypoint.sh /usr/local/bin/multi-codex-worker-entrypoint
+RUN chmod +x /usr/local/bin/multi-codex-worker-entrypoint
+
+USER codex
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/multi-codex-worker-entrypoint"]

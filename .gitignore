@@ -1,0 +1,36 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Go
+bin/
+coverage.out
+/api
+/mcp-gateway
+/mcxctl
+/worker-agentd
+
+# Node / Vite
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+apps/web/dist/
+apps/web/.vite/
+apps/web/.pnpm-store/
+apps/web/vite.config.d.ts
+apps/web/vite.config.js
+
+# Local runtime data
+.cache/
+.data/
+.tmp/
+.runs/
+.worktrees/
+.repos/
+demo-service.git/
+
+# Docker and editor noise
+*.log
+.idea/
+.vscode/

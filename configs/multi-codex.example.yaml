@@ -1,0 +1,46 @@
+server:
+  listen: ":8080"
+
+mcp_gateway:
+  listen: ":8090"
+  public_url: "http://localhost:8090"
+
+database:
+  url_env: "MULTICODEX_DATABASE_URL"
+
+storage:
+  artifact_root: "/var/lib/multi-codex/artifacts"
+  worktree_root: "/var/lib/multi-codex/worktrees"
+  repo_cache_root: "/var/lib/multi-codex/repos"
+
+executors:
+  docker:
+    enabled: true
+    default_network: "none"
+    worker_image_default: "multi-codex/codex-worker:go1.25-node-vite8"
+    cpu_limit: "2"
+    memory_limit: "4g"
+  ssh:
+    enabled: false
+    default_user: "codex-worker"
+    workspace_root: "/var/lib/multi-codex/workspaces"
+    runs_root: "/var/lib/multi-codex/runs"
+
+policy:
+  require_scope_check: true
+  require_audit: true
+  require_tests: true
+  require_human_before_push: true
+  forbidden_paths_default:
+    - ".github/**"
+    - ".gitlab/**"
+    - "infra/**"
+    - "k8s/**"
+    - "terraform/**"
+    - "secrets/**"
+    - ".env*"
+    - "**/*secret*"
+    - "**/*credential*"
+    - "package-lock.json"
+    - "pnpm-lock.yaml"
+    - "go.sum"

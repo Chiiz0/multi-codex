@@ -1,0 +1,19 @@
+FROM golang@sha256:154bd7001b6eb339e88c964442c0ad6ed5e53f09844cc818a41ce4ecb3ce3b43 AS build
+
+WORKDIR /src
+COPY go.mod ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/multi-codex-api ./cmd/api \
+  && CGO_ENABLED=0 GOOS=linux go build -o /out/multi-codex-mcp-gateway ./cmd/mcp-gateway \
+  && CGO_ENABLED=0 GOOS=linux go build -o /out/multi-codex-worker-agentd ./cmd/worker-agentd
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /out/multi-codex-api /usr/local/bin/multi-codex-api
+COPY --from=build /out/multi-codex-mcp-gateway /usr/local/bin/multi-codex-mcp-gateway
+COPY --from=build /out/multi-codex-worker-agentd /usr/local/bin/multi-codex-worker-agentd
+
+USER nonroot:nonroot
+EXPOSE 8080 8090 7070
+ENTRYPOINT ["/usr/local/bin/multi-codex-api"]

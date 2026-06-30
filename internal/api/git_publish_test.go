@@ -36,11 +36,67 @@ func TestGitPublishPRAuditsCredentialMetadata(t *testing.T) {
 		t.Fatalf("run = %#v", payload.Run)
 	}
 
-	assertAPIGitPublishEvent(t, st, payload.Run.ID)
-	assertAPIGitPublishAudit(t, st, payload.Run.ID)
+	assertAPIGitPublishEvent(t, st, payload.Run.ID, false)
+	assertAPIGitPublishAudit(t, st, payload.Run.ID, false)
 }
 
-func assertAPIGitPublishEvent(t *testing.T, st store.Store, runID string) {
+func TestGitPublishPRLiveCreatesProviderPRWithoutAutoMerge(t *testing.T) {
+	st := store.NewMemoryStore()
+	task := apiGitPublishReadyTask(t, st)
+	var gotAuthorization string
+	var gotPayload map[string]any
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/example/repo/pulls" {
+			t.Fatalf("provider path = %q", r.URL.Path)
+		}
+		gotAuthorization = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode provider payload: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"html_url":"https://github.com/example/repo/pull/42","number":42}`))
+	}))
+	defer provider.Close()
+	server := NewServer(config.Config{
+		GitSyncMode:  "live",
+		GitHubAPIURL: provider.URL,
+		GitHubToken:  "gh-live-token",
+	}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+task.ID+"/workflow/git_publish_pr", nil)
+	resp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusCreated {
+		t.Fatalf("publish status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var payload struct {
+		Run    domain.Run     `json:"run"`
+		Result map[string]any `json:"result"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode publish response: %v", err)
+	}
+	if payload.Run.Status != "succeeded" || payload.Result["status"] != "published" {
+		t.Fatalf("publish payload = %#v", payload)
+	}
+	if payload.Result["dry_run"] != false || payload.Result["auto_merge"] != false {
+		t.Fatalf("publish safety flags = %#v", payload.Result)
+	}
+	if payload.Result["pr_url"] != "https://github.com/example/repo/pull/42" {
+		t.Fatalf("pr url = %#v", payload.Result["pr_url"])
+	}
+	if gotAuthorization != "token gh-live-token" {
+		t.Fatalf("authorization = %q", gotAuthorization)
+	}
+	if gotPayload["head"] != "codex/publish-pr-metadata" || gotPayload["base"] != "main" {
+		t.Fatalf("provider payload = %#v", gotPayload)
+	}
+
+	assertAPIGitPublishEvent(t, st, payload.Run.ID, true)
+	assertAPIGitPublishAudit(t, st, payload.Run.ID, true)
+}
+
+func assertAPIGitPublishEvent(t *testing.T, st store.Store, runID string, wantCredentialResolved bool) {
 	t.Helper()
 	for _, event := range st.ListEvents(runID) {
 		if event.EventType != "git_publish_pr" {
@@ -49,7 +105,7 @@ func assertAPIGitPublishEvent(t *testing.T, st store.Store, runID string) {
 		if event.Payload["credential_provider"] != "env" {
 			t.Fatalf("credential provider event payload = %#v", event.Payload)
 		}
-		if resolved, ok := event.Payload["credential_resolved"].(bool); !ok || resolved {
+		if resolved, ok := event.Payload["credential_resolved"].(bool); !ok || resolved != wantCredentialResolved {
 			t.Fatalf("credential resolved event payload = %#v", event.Payload)
 		}
 		if event.Payload["auto_merge"] != false {
@@ -60,7 +116,7 @@ func assertAPIGitPublishEvent(t *testing.T, st store.Store, runID string) {
 	t.Fatalf("expected git_publish_pr run event")
 }
 
-func assertAPIGitPublishAudit(t *testing.T, st store.Store, runID string) {
+func assertAPIGitPublishAudit(t *testing.T, st store.Store, runID string, wantCredentialResolved bool) {
 	t.Helper()
 	for _, entry := range st.ListAuditLogs() {
 		if entry.Action != "api.git_publish_pr" || entry.ResourceID != runID {
@@ -69,7 +125,7 @@ func assertAPIGitPublishAudit(t *testing.T, st store.Store, runID string) {
 		if entry.Payload["credential_provider"] != "env" {
 			t.Fatalf("credential provider audit payload = %#v", entry.Payload)
 		}
-		if resolved, ok := entry.Payload["credential_resolved"].(bool); !ok || resolved {
+		if resolved, ok := entry.Payload["credential_resolved"].(bool); !ok || resolved != wantCredentialResolved {
 			t.Fatalf("credential resolved audit payload = %#v", entry.Payload)
 		}
 		if entry.Payload["auto_merge"] != false {

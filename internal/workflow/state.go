@@ -91,7 +91,7 @@ func BuildState(st store.Store, task domain.Task) domain.WorkflowState {
 
 	state.ReadyForPR = true
 	preparedPR := latestRunWithResultStatus(runs, "git_sync", "prepared")
-	publishedPR := latestRunWithResultStatus(runs, "git_sync", "publish_prepared", "published")
+	publishedPR := latestRunWithResultStatus(runs, "git_sync", "published")
 	if preparedPR == nil {
 		state.NextActions = append(state.NextActions, "git_prepare_pr")
 	} else if !hasApprovedApproval(approvals, "pr_publish") {

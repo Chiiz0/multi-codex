@@ -41,6 +41,8 @@ type Server struct {
 	log     *slog.Logger
 }
 
+type apiAuthContextKey struct{}
+
 const maxArtifactContentBytes int64 = 2 * 1024 * 1024
 const authSessionCookieName = "multi_codex_session"
 
@@ -69,7 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /metrics", s.metricsEndpoint)
 	mux.HandleFunc("/", s.routeAPI)
-	return s.metrics.Middleware(withCORS(s.withRBAC(mux)))
+	return s.metrics.Middleware(withCORS(s.cfg, s.withRBAC(mux)))
 }
 
 func (s *Server) routeAPI(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +161,7 @@ func (s *Server) routeAPI(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 1 && parts[0] == "tool-calls":
 		s.toolCalls(w, r)
 	case len(parts) == 1 && parts[0] == "audit-logs":
-		writeJSON(w, http.StatusOK, s.store.ListAuditLogs())
+		writeJSON(w, http.StatusOK, s.filterAuditLogsForAuth(r, s.store.ListAuditLogs()))
 	default:
 		writeError(w, http.StatusNotFound, "route not found")
 	}
@@ -411,7 +413,7 @@ func (s *Server) queue(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.queueSnapshot())
+	writeJSON(w, http.StatusOK, s.queueSnapshotForRequest(r))
 }
 
 func (s *Server) queueDispatch(w http.ResponseWriter, r *http.Request) {
@@ -419,23 +421,31 @@ func (s *Server) queueDispatch(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	if strings.EqualFold(s.cfg.AuthMode, "oidc") {
+		s.auditHuman(r, "api.queue_dispatch_manual_denied", "queue", "runs", map[string]any{
+			"reason":   "manual_dispatch_disabled_in_multi_org_mode",
+			"trace_id": observability.TraceID(r.Context()),
+		})
+		writeError(w, http.StatusForbidden, "manual queue dispatch is disabled in multi-organization mode")
+		return
+	}
 	run, err := s.dispatchOneQueuedRun("manual")
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			writeJSON(w, http.StatusNotFound, map[string]any{"error": "no queued run available", "queue": s.queueSnapshot()})
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "no queued run available", "queue": s.queueSnapshotForRequest(r)})
 			return
 		}
 		if errors.Is(err, store.ErrNoCapacity) {
 			w.Header().Set("Retry-After", fmt.Sprint(scheduler.DefaultRetryAfterSeconds))
 			s.auditHuman(r, "api.queue_dispatch_blocked", "queue", "runs", map[string]any{"reason": "no_executor_capacity"})
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "no executor capacity available", "queue": s.queueSnapshot()})
+			writeJSON(w, http.StatusConflict, map[string]any{"error": "no executor capacity available", "queue": s.queueSnapshotForRequest(r)})
 			return
 		}
 		notFound(w, err)
 		return
 	}
 	s.auditHuman(r, "api.queue_dispatch_manual", "run", run.ID, map[string]any{"task_id": run.TaskID, "role": run.Role, "executor": run.Executor})
-	writeJSON(w, http.StatusAccepted, map[string]any{"run": run, "queue": s.queueSnapshot()})
+	writeJSON(w, http.StatusAccepted, map[string]any{"run": run, "queue": s.queueSnapshotForRequest(r)})
 }
 
 func (s *Server) queueSnapshot() map[string]any {
@@ -452,6 +462,39 @@ func (s *Server) queueSnapshot() map[string]any {
 			"ssh":    scheduler.Snapshot(s.store, "ssh"),
 		},
 	}
+}
+
+func (s *Server) queueSnapshotForRequest(r *http.Request) map[string]any {
+	snapshot := s.queueSnapshot()
+	if queued, ok := snapshot["queued_runs"].([]domain.Run); ok {
+		snapshot["queued_runs"] = s.filterRunsForAuth(r, queued)
+	}
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		return snapshot
+	}
+	if backpressure, ok := snapshot["backpressure"].(map[string]any); ok {
+		for executorName, value := range backpressure {
+			state, ok := value.(scheduler.Backpressure)
+			if !ok {
+				continue
+			}
+			filteredNodes := []scheduler.NodeState{}
+			var available int64
+			for _, nodeState := range state.Nodes {
+				node, err := s.store.GetExecutorNode(nodeState.ID)
+				if err != nil || !canAccessOrg(auth, node.OrgID) {
+					continue
+				}
+				filteredNodes = append(filteredNodes, nodeState)
+				available += nodeState.AvailableSlots
+			}
+			state.Nodes = filteredNodes
+			state.AvailableSlots = available
+			backpressure[executorName] = state
+		}
+	}
+	return snapshot
 }
 
 func (s *Server) startTelemetryPushWorker() {
@@ -510,11 +553,15 @@ func (s *Server) metricsEndpoint(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(s.metrics.PrometheusText()))
-		_, _ = w.Write([]byte(observability.RunsPrometheusText("multi-codex-api", s.store.ListAllRuns())))
+		runs := s.store.ListAllRuns()
+		_, _ = w.Write([]byte(observability.RunsPrometheusText("multi-codex-api", runs)))
+		_, _ = w.Write([]byte(observability.OperationsPrometheusText("multi-codex-api", runs, s.store.ListAuditLogs())))
 		return
 	}
 	snapshot := s.metrics.Snapshot()
-	snapshot["runs"] = observability.RunMetricsSnapshot(s.store.ListAllRuns())
+	runs := s.store.ListAllRuns()
+	snapshot["runs"] = observability.RunMetricsSnapshot(runs)
+	snapshot["operations"] = observability.OperationsSnapshot(runs, s.store.ListAuditLogs())
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
@@ -937,7 +984,7 @@ func (s *Server) organizations(w http.ResponseWriter, r *http.Request) {
 func (s *Server) projects(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.store.ListProjects())
+		writeJSON(w, http.StatusOK, s.filterProjectsForAuth(r, s.store.ListProjects()))
 	case http.MethodPost:
 		var req struct {
 			Name        string `json:"name"`
@@ -951,7 +998,12 @@ func (s *Server) projects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "name and slug are required")
 			return
 		}
-		project := s.store.CreateProject(domain.Project{Name: req.Name, Slug: req.Slug, Description: req.Description})
+		auth, err := s.requestAuth(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		project := s.store.CreateProject(domain.Project{OrgID: auth.Membership.OrgID, Name: req.Name, Slug: req.Slug, Description: req.Description})
 		s.auditHuman(r, "api.project_create", "project", project.ID, map[string]any{"slug": project.Slug})
 		writeJSON(w, http.StatusCreated, project)
 	default:
@@ -964,15 +1016,17 @@ func (s *Server) project(w http.ResponseWriter, r *http.Request, projectID strin
 		methodNotAllowed(w)
 		return
 	}
-	project, err := s.store.GetProject(projectID)
-	if err != nil {
-		notFound(w, err)
+	project, ok := s.authorizeProject(w, r, projectID, "api.project_read")
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, project)
 }
 
 func (s *Server) repositories(w http.ResponseWriter, r *http.Request, projectID string) {
+	if _, ok := s.authorizeProject(w, r, projectID, "api.repositories_access"); !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.store.ListRepositories(projectID))
@@ -997,7 +1051,7 @@ func (s *Server) repositories(w http.ResponseWriter, r *http.Request, projectID 
 func (s *Server) skills(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.store.ListSkills())
+		writeJSON(w, http.StatusOK, s.filterSkillsForAuth(r, s.store.ListSkills()))
 	case http.MethodPost:
 		var req struct {
 			Name        string `json:"name"`
@@ -1014,7 +1068,13 @@ func (s *Server) skills(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "name and role are required")
 			return
 		}
+		auth, err := s.requestAuth(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
 		skill, err := s.store.CreateSkill(domain.Skill{
+			OrgID:       auth.Membership.OrgID,
 			Name:        req.Name,
 			Description: req.Description,
 			Role:        req.Role,
@@ -1040,10 +1100,16 @@ func (s *Server) skillVersions(w http.ResponseWriter, r *http.Request, skillID s
 		methodNotAllowed(w)
 		return
 	}
+	if _, ok := s.authorizeSkill(w, r, skillID, "api.skill_versions_read"); !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, s.store.ListSkillVersions(skillID))
 }
 
 func (s *Server) agentProfiles(w http.ResponseWriter, r *http.Request, projectID string) {
+	if _, ok := s.authorizeProject(w, r, projectID, "api.agent_profiles_access"); !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.store.ListAgentProfiles(projectID))
@@ -1076,7 +1142,7 @@ func (s *Server) agentProfiles(w http.ResponseWriter, r *http.Request, projectID
 func (s *Server) executorNodes(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, s.store.ListExecutorNodes())
+		writeJSON(w, http.StatusOK, s.filterExecutorNodesForAuth(r, s.store.ListExecutorNodes()))
 	case http.MethodPost:
 		var node domain.ExecutorNode
 		if !decodeJSON(w, r, &node) {
@@ -1086,6 +1152,12 @@ func (s *Server) executorNodes(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "kind and name are required")
 			return
 		}
+		auth, err := s.requestAuth(r)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		node.OrgID = auth.Membership.OrgID
 		created, err := s.store.RegisterExecutorNode(node)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -1101,6 +1173,9 @@ func (s *Server) executorNodes(w http.ResponseWriter, r *http.Request) {
 func (s *Server) verifyExecutorNodeHostKey(w http.ResponseWriter, r *http.Request, nodeID string) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
+		return
+	}
+	if _, ok := s.authorizeExecutorNode(w, r, nodeID, "api.executor_node_host_key_verify"); !ok {
 		return
 	}
 	var req struct {
@@ -1136,6 +1211,9 @@ func (s *Server) verifyExecutorNodeHostKey(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) tasks(w http.ResponseWriter, r *http.Request, projectID string) {
+	if _, ok := s.authorizeProject(w, r, projectID, "api.tasks_access"); !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.store.ListTasks(projectID))
@@ -1166,9 +1244,8 @@ func (s *Server) task(w http.ResponseWriter, r *http.Request, taskID string) {
 		methodNotAllowed(w)
 		return
 	}
-	task, err := s.store.GetTask(taskID)
-	if err != nil {
-		notFound(w, err)
+	task, ok := s.authorizeTask(w, r, taskID, "api.task_read")
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, task)
@@ -1179,9 +1256,8 @@ func (s *Server) validateTask(w http.ResponseWriter, r *http.Request, taskID str
 		methodNotAllowed(w)
 		return
 	}
-	task, err := s.store.GetTask(taskID)
-	if err != nil {
-		notFound(w, err)
+	task, ok := s.authorizeTask(w, r, taskID, "api.task_validate")
+	if !ok {
 		return
 	}
 	validation := policy.ValidateTaskWithResources(s.store, task.Envelope)
@@ -1199,9 +1275,8 @@ func (s *Server) startTask(w http.ResponseWriter, r *http.Request, taskID string
 		methodNotAllowed(w)
 		return
 	}
-	task, err := s.store.GetTask(taskID)
-	if err != nil {
-		notFound(w, err)
+	task, ok := s.authorizeTask(w, r, taskID, "api.worker_spawn")
+	if !ok {
 		return
 	}
 	validation := policy.ValidateTaskWithResources(s.store, task.Envelope)
@@ -1231,9 +1306,8 @@ func (s *Server) taskWorkflow(w http.ResponseWriter, r *http.Request, taskID str
 		methodNotAllowed(w)
 		return
 	}
-	task, err := s.store.GetTask(taskID)
-	if err != nil {
-		notFound(w, err)
+	task, ok := s.authorizeTask(w, r, taskID, "api.task_workflow_read")
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, workflow.BuildState(s.store, task))
@@ -1244,9 +1318,8 @@ func (s *Server) workflowAction(w http.ResponseWriter, r *http.Request, taskID s
 		methodNotAllowed(w)
 		return
 	}
-	task, err := s.store.GetTask(taskID)
-	if err != nil {
-		notFound(w, err)
+	task, ok := s.authorizeTask(w, r, taskID, "api.workflow_action")
+	if !ok {
 		return
 	}
 	state := workflow.BuildState(s.store, task)
@@ -1313,6 +1386,9 @@ func (s *Server) taskRuns(w http.ResponseWriter, r *http.Request, taskID string)
 		methodNotAllowed(w)
 		return
 	}
+	if _, ok := s.authorizeTask(w, r, taskID, "api.task_runs_read"); !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, s.store.ListRuns(taskID))
 }
 
@@ -1321,7 +1397,7 @@ func (s *Server) allRuns(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.ListAllRuns())
+	writeJSON(w, http.StatusOK, s.filterRunsForAuth(r, s.store.ListAllRuns()))
 }
 
 func (s *Server) scopeCheck(w http.ResponseWriter, r *http.Request, taskID string) {
@@ -1329,9 +1405,8 @@ func (s *Server) scopeCheck(w http.ResponseWriter, r *http.Request, taskID strin
 		methodNotAllowed(w)
 		return
 	}
-	task, err := s.store.GetTask(taskID)
-	if err != nil {
-		notFound(w, err)
+	task, ok := s.authorizeTask(w, r, taskID, "api.scope_check")
+	if !ok {
 		return
 	}
 	var req struct {
@@ -1359,6 +1434,9 @@ func (s *Server) scopeCheck(w http.ResponseWriter, r *http.Request, taskID strin
 }
 
 func (s *Server) taskApprovals(w http.ResponseWriter, r *http.Request, taskID string) {
+	if _, ok := s.authorizeTask(w, r, taskID, "api.task_approvals_access"); !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.store.ListApprovals(taskID))
@@ -1395,7 +1473,7 @@ func (s *Server) approvals(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.store.ListApprovals(""))
+	writeJSON(w, http.StatusOK, s.filterApprovalsForAuth(r, s.store.ListApprovals("")))
 }
 
 func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approvalID string) {
@@ -1412,6 +1490,9 @@ func (s *Server) decideApproval(w http.ResponseWriter, r *http.Request, approval
 	}
 	if req.Status != "approved" && req.Status != "rejected" {
 		writeError(w, http.StatusBadRequest, "status must be approved or rejected")
+		return
+	}
+	if _, ok := s.authorizeApproval(w, r, approvalID, "api.approval_decide"); !ok {
 		return
 	}
 	approval, err := s.store.DecideApproval(approvalID, req.Status, "", req.Reason)
@@ -1431,9 +1512,8 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request, runID string) {
 		methodNotAllowed(w)
 		return
 	}
-	run, err := s.store.GetRun(runID)
-	if err != nil {
-		notFound(w, err)
+	run, _, ok := s.authorizeRun(w, r, runID, "api.run_read")
+	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
@@ -1442,8 +1522,14 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request, runID string) {
 func (s *Server) runEvents(w http.ResponseWriter, r *http.Request, runID string) {
 	switch r.Method {
 	case http.MethodGet:
+		if _, _, ok := s.authorizeRun(w, r, runID, "api.run_events_read"); !ok {
+			return
+		}
 		writeJSON(w, http.StatusOK, s.store.ListEvents(runID))
 	case http.MethodPost:
+		if _, _, ok := s.authorizeRun(w, r, runID, "api.run_events_write"); !ok {
+			return
+		}
 		var req struct {
 			Level     string         `json:"level"`
 			EventType string         `json:"event_type"`
@@ -1476,6 +1562,9 @@ func (s *Server) runArtifacts(w http.ResponseWriter, r *http.Request, runID stri
 		methodNotAllowed(w)
 		return
 	}
+	if _, _, ok := s.authorizeRun(w, r, runID, "api.run_artifacts_read"); !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, s.store.ListArtifacts(runID))
 }
 
@@ -1484,12 +1573,8 @@ func (s *Server) artifactContent(w http.ResponseWriter, r *http.Request, artifac
 		methodNotAllowed(w)
 		return
 	}
-	artifact, err := s.store.GetArtifact(artifactID)
-	if err != nil {
-		s.auditHuman(r, "api.artifact_read_missing", "artifact", artifactID, map[string]any{
-			"trace_id": observability.TraceID(r.Context()),
-		})
-		notFound(w, err)
+	artifact, ok := s.authorizeArtifact(w, r, artifactID, "api.artifact_read")
+	if !ok {
 		return
 	}
 	content, truncated, err := readArtifactContent(artifact)
@@ -1530,6 +1615,9 @@ func (s *Server) artifactContent(w http.ResponseWriter, r *http.Request, artifac
 func (s *Server) finishRun(w http.ResponseWriter, r *http.Request, runID string) {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
+		return
+	}
+	if _, _, ok := s.authorizeRun(w, r, runID, "api.worker_result"); !ok {
 		return
 	}
 	var req struct {
@@ -1854,19 +1942,48 @@ func splitPath(path string) []string {
 	return strings.Split(path, "/")
 }
 
-func withCORS(next http.Handler) http.Handler {
+func withCORS(cfg config.Config, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		restricted := cfg.IsProduction() || len(cfg.CORSAllowedOrigins) > 0
 		if origin := r.Header.Get("Origin"); origin != "" {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			if corsOriginAllowed(cfg, origin) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			} else if restricted {
+				writeError(w, http.StatusForbidden, "origin is not allowed")
+				return
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
 		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+			if !restricted {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			}
 		}
 		w.Header().Set("Access-Control-Allow-Headers", "content-type, authorization")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 		next.ServeHTTP(w, r)
 	})
+}
+
+func corsOriginAllowed(cfg config.Config, origin string) bool {
+	origin = strings.TrimSpace(origin)
+	if origin == "" {
+		return false
+	}
+	for _, allowed := range cfg.CORSAllowedOrigins {
+		allowed = strings.TrimSpace(allowed)
+		if allowed == origin {
+			return true
+		}
+		if allowed == "*" && !cfg.IsProduction() {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) withRBAC(next http.Handler) http.Handler {
@@ -1893,7 +2010,7 @@ func (s *Server) withRBAC(next http.Handler) http.Handler {
 			return
 		}
 		if hasPermission(auth.Permissions, required) {
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), apiAuthContextKey{}, auth)))
 			return
 		}
 		s.audit("human", auth.User.ID, "api.rbac_denied", "http_request", r.URL.Path, map[string]any{
@@ -1966,6 +2083,237 @@ func hasPermission(permissions []string, required string) bool {
 		}
 	}
 	return false
+}
+
+func (s *Server) requestAuth(r *http.Request) (domain.AuthContext, error) {
+	if auth, ok := r.Context().Value(apiAuthContextKey{}).(domain.AuthContext); ok {
+		return auth, nil
+	}
+	return s.authContext(r)
+}
+
+func canAccessOrg(auth domain.AuthContext, orgID string) bool {
+	return orgID == "" || auth.Membership.OrgID == "" || auth.Membership.OrgID == orgID
+}
+
+func (s *Server) denyResource(w http.ResponseWriter, r *http.Request, auth domain.AuthContext, action string, resourceType string, resourceID string, resourceOrgID string) {
+	actorID := auth.User.ID
+	if actorID == "" {
+		actorID = "anonymous"
+	}
+	s.auditWithOrg(auth.Membership.OrgID, "human", actorID, "api.authorization_denied", resourceType, resourceID, map[string]any{
+		"action":          action,
+		"actor_org_id":    auth.Membership.OrgID,
+		"resource_org_id": resourceOrgID,
+		"trace_id":        observability.TraceID(r.Context()),
+	})
+	writeError(w, http.StatusForbidden, "permission denied")
+}
+
+func (s *Server) authorizeProject(w http.ResponseWriter, r *http.Request, projectID string, action string) (domain.Project, bool) {
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		notFound(w, err)
+		return domain.Project{}, false
+	}
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return domain.Project{}, false
+	}
+	if !canAccessOrg(auth, project.OrgID) {
+		s.denyResource(w, r, auth, action, "project", project.ID, project.OrgID)
+		return domain.Project{}, false
+	}
+	return project, true
+}
+
+func (s *Server) authorizeTask(w http.ResponseWriter, r *http.Request, taskID string, action string) (domain.Task, bool) {
+	task, err := s.store.GetTask(taskID)
+	if err != nil {
+		notFound(w, err)
+		return domain.Task{}, false
+	}
+	if _, ok := s.authorizeProject(w, r, task.ProjectID, action); !ok {
+		return domain.Task{}, false
+	}
+	return task, true
+}
+
+func (s *Server) authorizeRun(w http.ResponseWriter, r *http.Request, runID string, action string) (domain.Run, domain.Task, bool) {
+	run, err := s.store.GetRun(runID)
+	if err != nil {
+		notFound(w, err)
+		return domain.Run{}, domain.Task{}, false
+	}
+	task, ok := s.authorizeTask(w, r, run.TaskID, action)
+	if !ok {
+		return domain.Run{}, domain.Task{}, false
+	}
+	return run, task, true
+}
+
+func (s *Server) authorizeArtifact(w http.ResponseWriter, r *http.Request, artifactID string, action string) (domain.Artifact, bool) {
+	artifact, err := s.store.GetArtifact(artifactID)
+	if err != nil {
+		s.auditHuman(r, "api.artifact_read_missing", "artifact", artifactID, map[string]any{
+			"trace_id": observability.TraceID(r.Context()),
+		})
+		notFound(w, err)
+		return domain.Artifact{}, false
+	}
+	if _, _, ok := s.authorizeRun(w, r, artifact.RunID, action); !ok {
+		return domain.Artifact{}, false
+	}
+	return artifact, true
+}
+
+func (s *Server) authorizeSkill(w http.ResponseWriter, r *http.Request, skillID string, action string) (domain.Skill, bool) {
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return domain.Skill{}, false
+	}
+	for _, skill := range s.store.ListSkills() {
+		if skill.ID != skillID {
+			continue
+		}
+		if !canAccessOrg(auth, skill.OrgID) {
+			s.denyResource(w, r, auth, action, "skill", skill.ID, skill.OrgID)
+			return domain.Skill{}, false
+		}
+		return skill, true
+	}
+	notFound(w, store.ErrNotFound)
+	return domain.Skill{}, false
+}
+
+func (s *Server) authorizeExecutorNode(w http.ResponseWriter, r *http.Request, nodeID string, action string) (domain.ExecutorNode, bool) {
+	node, err := s.store.GetExecutorNode(nodeID)
+	if err != nil {
+		notFound(w, err)
+		return domain.ExecutorNode{}, false
+	}
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return domain.ExecutorNode{}, false
+	}
+	if !canAccessOrg(auth, node.OrgID) {
+		s.denyResource(w, r, auth, action, "executor_node", node.ID, node.OrgID)
+		return domain.ExecutorNode{}, false
+	}
+	return node, true
+}
+
+func (s *Server) authorizeApproval(w http.ResponseWriter, r *http.Request, approvalID string, action string) (domain.Approval, bool) {
+	for _, approval := range s.store.ListApprovals("") {
+		if approval.ID != approvalID {
+			continue
+		}
+		if _, ok := s.authorizeTask(w, r, approval.TaskID, action); !ok {
+			return domain.Approval{}, false
+		}
+		return approval, true
+	}
+	notFound(w, store.ErrNotFound)
+	return domain.Approval{}, false
+}
+
+func (s *Server) filterProjectsForAuth(r *http.Request, projects []domain.Project) []domain.Project {
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		return nil
+	}
+	filtered := []domain.Project{}
+	for _, project := range projects {
+		if canAccessOrg(auth, project.OrgID) {
+			filtered = append(filtered, project)
+		}
+	}
+	return filtered
+}
+
+func (s *Server) filterSkillsForAuth(r *http.Request, skills []domain.Skill) []domain.Skill {
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		return nil
+	}
+	filtered := []domain.Skill{}
+	for _, skill := range skills {
+		if canAccessOrg(auth, skill.OrgID) {
+			filtered = append(filtered, skill)
+		}
+	}
+	return filtered
+}
+
+func (s *Server) filterExecutorNodesForAuth(r *http.Request, nodes []domain.ExecutorNode) []domain.ExecutorNode {
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		return nil
+	}
+	filtered := []domain.ExecutorNode{}
+	for _, node := range nodes {
+		if canAccessOrg(auth, node.OrgID) {
+			filtered = append(filtered, node)
+		}
+	}
+	return filtered
+}
+
+func (s *Server) filterRunsForAuth(r *http.Request, runs []domain.Run) []domain.Run {
+	filtered := []domain.Run{}
+	for _, run := range runs {
+		task, err := s.store.GetTask(run.TaskID)
+		if err != nil {
+			continue
+		}
+		project, err := s.store.GetProject(task.ProjectID)
+		if err != nil {
+			continue
+		}
+		auth, err := s.requestAuth(r)
+		if err != nil || !canAccessOrg(auth, project.OrgID) {
+			continue
+		}
+		filtered = append(filtered, run)
+	}
+	return filtered
+}
+
+func (s *Server) filterApprovalsForAuth(r *http.Request, approvals []domain.Approval) []domain.Approval {
+	filtered := []domain.Approval{}
+	for _, approval := range approvals {
+		task, err := s.store.GetTask(approval.TaskID)
+		if err != nil {
+			continue
+		}
+		project, err := s.store.GetProject(task.ProjectID)
+		if err != nil {
+			continue
+		}
+		auth, err := s.requestAuth(r)
+		if err != nil || !canAccessOrg(auth, project.OrgID) {
+			continue
+		}
+		filtered = append(filtered, approval)
+	}
+	return filtered
+}
+
+func (s *Server) filterAuditLogsForAuth(r *http.Request, logs []domain.AuditLog) []domain.AuditLog {
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		return nil
+	}
+	filtered := []domain.AuditLog{}
+	for _, entry := range logs {
+		if entry.OrgID == "" || canAccessOrg(auth, entry.OrgID) {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
 }
 
 func (s *Server) authContext(r *http.Request) (domain.AuthContext, error) {
@@ -2377,7 +2725,12 @@ func bodyArtifactID(result map[string]any) string {
 }
 
 func (s *Server) audit(actorType string, actorID string, action string, resourceType string, resourceID string, payload map[string]any) {
+	s.auditWithOrg("", actorType, actorID, action, resourceType, resourceID, payload)
+}
+
+func (s *Server) auditWithOrg(orgID string, actorType string, actorID string, action string, resourceType string, resourceID string, payload map[string]any) {
 	s.store.RecordAuditLog(domain.AuditLog{
+		OrgID:        orgID,
 		ActorType:    actorType,
 		ActorID:      actorID,
 		Action:       action,
@@ -2389,10 +2742,12 @@ func (s *Server) audit(actorType string, actorID string, action string, resource
 
 func (s *Server) auditHuman(r *http.Request, action string, resourceType string, resourceID string, payload map[string]any) {
 	actorID := "local-dev"
-	if auth, err := s.authContext(r); err == nil && auth.User.ID != "" {
+	orgID := ""
+	if auth, err := s.requestAuth(r); err == nil && auth.User.ID != "" {
 		actorID = auth.User.ID
+		orgID = auth.Membership.OrgID
 	} else if strings.EqualFold(s.cfg.AuthMode, "oidc") {
 		actorID = "anonymous"
 	}
-	s.audit("human", actorID, action, resourceType, resourceID, payload)
+	s.auditWithOrg(orgID, "human", actorID, action, resourceType, resourceID, payload)
 }

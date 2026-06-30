@@ -10,8 +10,10 @@ import (
 func ValidateTaskWithResources(st store.Store, envelope domain.TaskEnvelope) domain.ValidationResult {
 	result := ValidateTaskEnvelope(envelope)
 
-	if _, err := st.GetRepository(envelope.RepositoryID); err != nil {
+	if repo, err := st.GetRepository(envelope.RepositoryID); err != nil {
 		result.Errors = append(result.Errors, "repository_id does not reference a known repository")
+	} else if repo.ProjectID != envelope.ProjectID {
+		result.Errors = append(result.Errors, "repository_id does not belong to task project_id")
 	}
 
 	var skillFound bool

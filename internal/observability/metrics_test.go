@@ -94,3 +94,28 @@ func TestRunMetricsSnapshotGroupsRuns(t *testing.T) {
 		t.Fatalf("expected run duration histogram bucket, got:\n%s", text)
 	}
 }
+
+func TestOperationsPrometheusTextIncludesQueueAndAuditSignals(t *testing.T) {
+	now := time.Unix(1000, 0).UTC()
+	text := OperationsPrometheusText("multi-codex-test", []domain.Run{
+		{Executor: "docker", Status: "queued"},
+		{Executor: "docker", Status: "queued"},
+		{Executor: "ssh", Status: "failed"},
+		{Executor: "docker", Status: "timed_out"},
+	}, []domain.AuditLog{
+		{Action: "api.audit_ship_failed", CreatedAt: now},
+		{Action: "api.retention_cleanup_failed", CreatedAt: now.Add(time.Minute)},
+	})
+
+	for _, needle := range []string{
+		`multi_codex_queue_depth{service="multi-codex-test",executor="docker"} 2`,
+		`multi_codex_worker_terminal_failures{service="multi-codex-test",status="failed"} 1`,
+		`multi_codex_worker_terminal_failures{service="multi-codex-test",status="timed_out"} 1`,
+		`multi_codex_audit_action_total{service="multi-codex-test",action="api.audit_ship_failed"} 1`,
+		`multi_codex_audit_action_last_seen_timestamp_seconds{service="multi-codex-test",action="api.retention_cleanup_failed"} 1060`,
+	} {
+		if !strings.Contains(text, needle) {
+			t.Fatalf("operations metrics missing %q:\n%s", needle, text)
+		}
+	}
+}

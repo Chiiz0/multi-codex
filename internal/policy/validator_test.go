@@ -59,6 +59,64 @@ func TestCheckScopePassesAllowedFiles(t *testing.T) {
 	}
 }
 
+func TestCheckCommandPolicyBlocksDeniedCommands(t *testing.T) {
+	result := CheckCommandPolicy(
+		[]string{"go test ./...", "git push origin main", "docker run alpine"},
+		nil,
+		[]string{"git push", "docker"},
+	)
+
+	if result.Status != "blocked" {
+		t.Fatalf("status = %q", result.Status)
+	}
+	if len(result.Violations) != 2 {
+		t.Fatalf("violations = %#v", result.Violations)
+	}
+}
+
+func TestCheckCommandPolicyHonorsAllowlistWhenConfigured(t *testing.T) {
+	result := CheckCommandPolicy(
+		[]string{"go test ./...", "pnpm install"},
+		[]string{"go test"},
+		nil,
+	)
+
+	if result.Status != "blocked" {
+		t.Fatalf("status = %q", result.Status)
+	}
+	if !result.AllowlistActive {
+		t.Fatalf("allowlist should be active")
+	}
+	if len(result.Violations) != 1 || result.Violations[0] != "pnpm install is outside worker command allowlist" {
+		t.Fatalf("violations = %#v", result.Violations)
+	}
+}
+
+func TestCheckDependencyPolicyBlocksLockfilesWhenDisabled(t *testing.T) {
+	result := CheckDependencyPolicy(
+		[]string{"internal/policy/scope.go", "services/api/go.mod", "apps/web/pnpm-lock.yaml"},
+		false,
+	)
+
+	if result.Status != "blocked" {
+		t.Fatalf("status = %q", result.Status)
+	}
+	if len(result.ChangedFiles) != 2 || len(result.Violations) != 2 {
+		t.Fatalf("dependency result = %#v", result)
+	}
+}
+
+func TestCheckDependencyPolicyAllowsLockfilesWhenEnabled(t *testing.T) {
+	result := CheckDependencyPolicy([]string{"go.sum"}, true)
+
+	if result.Status != "passed" {
+		t.Fatalf("status = %q", result.Status)
+	}
+	if len(result.ChangedFiles) != 1 || len(result.Violations) != 0 {
+		t.Fatalf("dependency result = %#v", result)
+	}
+}
+
 func validEnvelope(mutators ...func(*domain.TaskEnvelope)) domain.TaskEnvelope {
 	envelope := domain.TaskEnvelope{
 		TaskID:         "FEAT-1",

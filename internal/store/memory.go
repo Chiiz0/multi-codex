@@ -98,6 +98,7 @@ func (s *MemoryStore) seed() {
 	}
 	project := domain.Project{
 		ID:          "proj_demo",
+		OrgID:       membership.OrgID,
 		Name:        "Demo Engineering",
 		Slug:        "demo-engineering",
 		Description: "Seed project for local multi-codex development.",
@@ -117,12 +118,19 @@ func (s *MemoryStore) seed() {
 	s.repositories[repo.ID] = repo
 	for _, seed := range seedSkillVersions(now) {
 		s.skills[seed.Skill.ID] = seed.Skill
+		if seed.Skill.OrgID == "" {
+			seed.Skill.OrgID = membership.OrgID
+			s.skills[seed.Skill.ID] = seed.Skill
+		}
 		s.skillVersions[seed.Skill.ID] = append(s.skillVersions[seed.Skill.ID], seed.Version)
 	}
 	for _, profile := range seedProfiles(project.ID, now) {
 		s.profiles[profile.ID] = profile
 	}
 	for _, node := range seedNodes(now) {
+		if node.OrgID == "" {
+			node.OrgID = membership.OrgID
+		}
 		s.nodes[node.ID] = node
 	}
 }
@@ -470,6 +478,9 @@ func (s *MemoryStore) CreateProject(project domain.Project) domain.Project {
 	if project.ID == "" {
 		project.ID = domain.NewID("proj")
 	}
+	if project.OrgID == "" {
+		project.OrgID = s.auth.Membership.OrgID
+	}
 	project.CreatedAt = now
 	s.projects[project.ID] = project
 	return project
@@ -570,6 +581,9 @@ func (s *MemoryStore) CreateSkill(skill domain.Skill, version domain.SkillVersio
 	if skill.Role == "" {
 		skill.Role = "feature"
 	}
+	if skill.OrgID == "" {
+		skill.OrgID = s.auth.Membership.OrgID
+	}
 	if version.Version == "" {
 		version.Version = "local"
 	}
@@ -666,6 +680,9 @@ func (s *MemoryStore) RegisterExecutorNode(node domain.ExecutorNode) (domain.Exe
 
 	if node.ID == "" {
 		node.ID = domain.NewID("node")
+	}
+	if node.OrgID == "" {
+		node.OrgID = s.auth.Membership.OrgID
 	}
 	if node.Status == "" {
 		node.Status = "active"
@@ -1371,6 +1388,9 @@ func (s *MemoryStore) RecordAuditLog(entry domain.AuditLog) domain.AuditLog {
 
 	if entry.ID == "" {
 		entry.ID = domain.NewID("audit")
+	}
+	if entry.OrgID == "" {
+		entry.OrgID = s.auth.Membership.OrgID
 	}
 	prevHash := ""
 	if len(s.auditLogs) > 0 {

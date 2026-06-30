@@ -124,7 +124,7 @@ func (s *PostgresStore) ListProjects() []domain.Project {
 	defer cancel()
 
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id::text, name, slug, description, created_at
+SELECT id::text, org_id::text, name, slug, description, created_at
 FROM projects
 ORDER BY created_at ASC`)
 	if err != nil {
@@ -136,7 +136,7 @@ ORDER BY created_at ASC`)
 	projects := []domain.Project{}
 	for rows.Next() {
 		var project domain.Project
-		if err := rows.Scan(&project.ID, &project.Name, &project.Slug, &project.Description, &project.CreatedAt); err != nil {
+		if err := rows.Scan(&project.ID, &project.OrgID, &project.Name, &project.Slug, &project.Description, &project.CreatedAt); err != nil {
 			s.log.Error("scan project failed", "error", err)
 			return projects
 		}
@@ -152,12 +152,15 @@ func (s *PostgresStore) CreateProject(project domain.Project) domain.Project {
 	if project.Description == "" {
 		project.Description = ""
 	}
+	if project.OrgID == "" {
+		project.OrgID = defaultOrgID
+	}
 	err := s.db.QueryRowContext(ctx, `
 INSERT INTO projects (org_id, name, slug, description)
 VALUES ($1, $2, $3, $4)
-RETURNING id::text, name, slug, description, created_at`,
-		defaultOrgID, project.Name, project.Slug, project.Description,
-	).Scan(&project.ID, &project.Name, &project.Slug, &project.Description, &project.CreatedAt)
+RETURNING id::text, org_id::text, name, slug, description, created_at`,
+		project.OrgID, project.Name, project.Slug, project.Description,
+	).Scan(&project.ID, &project.OrgID, &project.Name, &project.Slug, &project.Description, &project.CreatedAt)
 	if err != nil {
 		s.log.Error("create project failed", "error", err)
 	}
@@ -173,9 +176,9 @@ func (s *PostgresStore) GetProject(id string) (domain.Project, error) {
 
 	var project domain.Project
 	err := s.db.QueryRowContext(ctx, `
-SELECT id::text, name, slug, description, created_at
+SELECT id::text, org_id::text, name, slug, description, created_at
 FROM projects
-WHERE id = $1`, id).Scan(&project.ID, &project.Name, &project.Slug, &project.Description, &project.CreatedAt)
+WHERE id = $1`, id).Scan(&project.ID, &project.OrgID, &project.Name, &project.Slug, &project.Description, &project.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Project{}, ErrNotFound
 	}
@@ -768,7 +771,7 @@ func (s *PostgresStore) ListAuditLogs() []domain.AuditLog {
 	defer cancel()
 
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id::text, actor_type, actor_id, action, resource_type, resource_id, payload,
+SELECT id::text, org_id::text, actor_type, actor_id, action, resource_type, resource_id, payload,
        COALESCE(prev_hash, ''), COALESCE(entry_hash, ''), created_at
 FROM audit_logs
 ORDER BY created_at DESC
@@ -783,7 +786,7 @@ LIMIT 200`)
 	for rows.Next() {
 		var entry domain.AuditLog
 		var payloadBytes []byte
-		if err := rows.Scan(&entry.ID, &entry.ActorType, &entry.ActorID, &entry.Action, &entry.ResourceType, &entry.ResourceID, &payloadBytes, &entry.PrevHash, &entry.EntryHash, &entry.CreatedAt); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.OrgID, &entry.ActorType, &entry.ActorID, &entry.Action, &entry.ResourceType, &entry.ResourceID, &payloadBytes, &entry.PrevHash, &entry.EntryHash, &entry.CreatedAt); err != nil {
 			s.log.Error("scan audit log failed", "error", err)
 			return logs
 		}
@@ -798,7 +801,7 @@ func (s *PostgresStore) ListAuditLogsForSeal() []domain.AuditLog {
 	defer cancel()
 
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id::text, actor_type, actor_id, action, resource_type, resource_id, payload,
+SELECT id::text, org_id::text, actor_type, actor_id, action, resource_type, resource_id, payload,
        COALESCE(prev_hash, ''), COALESCE(entry_hash, ''), created_at
 FROM audit_logs
 ORDER BY created_at ASC, id ASC`)
@@ -812,7 +815,7 @@ ORDER BY created_at ASC, id ASC`)
 	for rows.Next() {
 		var entry domain.AuditLog
 		var payloadBytes []byte
-		if err := rows.Scan(&entry.ID, &entry.ActorType, &entry.ActorID, &entry.Action, &entry.ResourceType, &entry.ResourceID, &payloadBytes, &entry.PrevHash, &entry.EntryHash, &entry.CreatedAt); err != nil {
+		if err := rows.Scan(&entry.ID, &entry.OrgID, &entry.ActorType, &entry.ActorID, &entry.Action, &entry.ResourceType, &entry.ResourceID, &payloadBytes, &entry.PrevHash, &entry.EntryHash, &entry.CreatedAt); err != nil {
 			s.log.Error("scan audit log for seal failed", "error", err)
 			return logs
 		}
@@ -838,13 +841,16 @@ func (s *PostgresStore) RecordAuditLog(entry domain.AuditLog) domain.AuditLog {
 		return entry
 	}
 
+	if entry.OrgID == "" {
+		entry.OrgID = defaultOrgID
+	}
 	var prevHash string
 	err = tx.QueryRowContext(ctx, `
 SELECT COALESCE(entry_hash, '')
 FROM audit_logs
 WHERE org_id = $1 AND COALESCE(entry_hash, '') <> ''
 ORDER BY created_at DESC, id DESC
-LIMIT 1`, defaultOrgID).Scan(&prevHash)
+LIMIT 1`, entry.OrgID).Scan(&prevHash)
 	if errors.Is(err, sql.ErrNoRows) {
 		prevHash = ""
 	} else if err != nil {
@@ -856,7 +862,7 @@ LIMIT 1`, defaultOrgID).Scan(&prevHash)
 INSERT INTO audit_logs (org_id, actor_type, actor_id, action, resource_type, resource_id, payload, prev_hash, entry_hash, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING id::text`,
-		defaultOrgID, entry.ActorType, entry.ActorID, entry.Action, entry.ResourceType, entry.ResourceID, payloadBytes, entry.PrevHash, entry.EntryHash, entry.CreatedAt,
+		entry.OrgID, entry.ActorType, entry.ActorID, entry.Action, entry.ResourceType, entry.ResourceID, payloadBytes, entry.PrevHash, entry.EntryHash, entry.CreatedAt,
 	).Scan(&entry.ID)
 	if err != nil {
 		s.log.Error("record audit log failed", "error", err, "action", entry.Action)

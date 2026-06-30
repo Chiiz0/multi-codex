@@ -36,6 +36,10 @@ type runResult struct {
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg := config.FromEnv()
+	if err := config.ValidateProduction(cfg, "worker-agentd"); err != nil {
+		log.Error("production configuration rejected", "error", err)
+		os.Exit(1)
+	}
 	server := &agentServer{runRoot: cfg.RunRoot, token: cfg.AgentDToken, log: log}
 	if len(os.Args) > 1 && os.Args[1] == "--forced-command" {
 		if err := server.forcedCommand(os.Stdin, os.Stdout); err != nil {

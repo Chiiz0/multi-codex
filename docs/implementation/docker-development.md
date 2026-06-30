@@ -6,7 +6,7 @@ Development uses one fixed toolchain image:
 multi-codex/dev:go1.25-node25.9-pnpm11.7
 ```
 
-This image contains Go, Node, pnpm, Git, PostgreSQL client tools, and common shell utilities. Build it explicitly once:
+This image contains Go, Node, pnpm, Git, PostgreSQL 18 client tools, and common shell utilities. Build it explicitly once:
 
 ```bash
 make dev-image
@@ -47,6 +47,7 @@ Docker worker credentials are opt-in. Add env names to `MULTICODEX_WORKER_SECRET
 The dev Compose file uses local PostgreSQL trust auth and passwordless connection URLs. The production-style Compose file requires `POSTGRES_PASSWORD` from local environment or `.env`; `.env.example` intentionally leaves it blank.
 
 PostgreSQL 18 must mount its volume at `/var/lib/postgresql`, not `/var/lib/postgresql/data`.
+The fixed dev image installs `postgresql-client-18` so `pg_dump` and `psql` match the Compose database major version for backup and restore drills.
 
 ## Refreshing the Image
 

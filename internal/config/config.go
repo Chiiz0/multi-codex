@@ -10,11 +10,14 @@ import (
 )
 
 type Config struct {
+	Environment                      string
+	ProductionMode                   bool
 	APIListen                        string
 	MCPListen                        string
 	AgentDListen                     string
 	AgentDURL                        string
 	AgentDToken                      string
+	CORSAllowedOrigins               []string
 	MCPSessionTTL                    time.Duration
 	MCPLiveFanoutInterval            time.Duration
 	DatabaseURL                      string
@@ -25,6 +28,17 @@ type Config struct {
 	ExecutorMode                     string
 	WorkerImage                      string
 	WorkerDefaultTimeout             time.Duration
+	WorkerCPUs                       string
+	WorkerMemory                     string
+	WorkerPidsLimit                  int
+	WorkerReadOnlyRootFS             bool
+	WorkerTmpfsSize                  string
+	WorkerNoNewPrivileges            bool
+	WorkerCapDrop                    []string
+	WorkerCommandAllowlist           []string
+	WorkerCommandDenylist            []string
+	WorkerDockerSocketEnabled        bool
+	WorkerDockerSocketBoundary       string
 	WorkerSecretEnvAllowlist         []string
 	WorkerSecretProvider             string
 	WorkerSecretFilePath             string
@@ -69,6 +83,7 @@ type Config struct {
 	AuditShipTarget                  string
 	AuditShipAllowLegacyHashMismatch bool
 	GitSyncMode                      string
+	GitSyncLiveReviewed              bool
 	GitCredentialProvider            string
 	GitCredentialFilePath            string
 	GitVaultAddress                  string
@@ -85,11 +100,14 @@ type Config struct {
 
 func FromEnv() Config {
 	return Config{
+		Environment:                      env("MULTICODEX_ENV", "development"),
+		ProductionMode:                   envBool("MULTICODEX_PRODUCTION", false),
 		APIListen:                        env("MULTICODEX_API_LISTEN", ":8080"),
 		MCPListen:                        env("MULTICODEX_MCP_LISTEN", ":8090"),
 		AgentDListen:                     env("MULTICODEX_AGENTD_LISTEN", ":7070"),
 		AgentDURL:                        env("MULTICODEX_AGENTD_URL", "http://localhost:7070"),
 		AgentDToken:                      env("MULTICODEX_AGENTD_TOKEN", ""),
+		CORSAllowedOrigins:               envList("MULTICODEX_CORS_ALLOWED_ORIGINS"),
 		MCPSessionTTL:                    envDuration("MULTICODEX_MCP_SESSION_TTL", 8*time.Hour),
 		MCPLiveFanoutInterval:            envDuration("MULTICODEX_MCP_LIVE_FANOUT_INTERVAL", time.Second),
 		DatabaseURL:                      env("MULTICODEX_DATABASE_URL", ""),
@@ -100,6 +118,17 @@ func FromEnv() Config {
 		ExecutorMode:                     env("MULTICODEX_EXECUTOR_MODE", "mock"),
 		WorkerImage:                      env("MULTICODEX_WORKER_IMAGE", "multi-codex/codex-worker:go1.25-node-vite8"),
 		WorkerDefaultTimeout:             envDuration("MULTICODEX_WORKER_DEFAULT_TIMEOUT", time.Hour),
+		WorkerCPUs:                       env("MULTICODEX_WORKER_CPUS", "1"),
+		WorkerMemory:                     env("MULTICODEX_WORKER_MEMORY", "2g"),
+		WorkerPidsLimit:                  envInt("MULTICODEX_WORKER_PIDS_LIMIT", 256),
+		WorkerReadOnlyRootFS:             envBool("MULTICODEX_WORKER_READ_ONLY_ROOTFS", true),
+		WorkerTmpfsSize:                  env("MULTICODEX_WORKER_TMPFS_SIZE", "256m"),
+		WorkerNoNewPrivileges:            envBool("MULTICODEX_WORKER_NO_NEW_PRIVILEGES", true),
+		WorkerCapDrop:                    envCommandList("MULTICODEX_WORKER_CAP_DROP", []string{"ALL"}),
+		WorkerCommandAllowlist:           envCommandList("MULTICODEX_WORKER_COMMAND_ALLOWLIST", nil),
+		WorkerCommandDenylist:            envCommandList("MULTICODEX_WORKER_COMMAND_DENYLIST", defaultWorkerCommandDenylist()),
+		WorkerDockerSocketEnabled:        envBool("MULTICODEX_WORKER_DOCKER_SOCKET_ENABLED", false),
+		WorkerDockerSocketBoundary:       env("MULTICODEX_WORKER_DOCKER_SOCKET_BOUNDARY", ""),
 		WorkerSecretEnvAllowlist:         envList("MULTICODEX_WORKER_SECRET_ENV_ALLOWLIST"),
 		WorkerSecretProvider:             env("MULTICODEX_WORKER_SECRET_PROVIDER", "env"),
 		WorkerSecretFilePath:             env("MULTICODEX_WORKER_SECRET_FILE_PATH", ""),
@@ -144,6 +173,7 @@ func FromEnv() Config {
 		AuditShipTarget:                  env("MULTICODEX_AUDIT_SHIP_TARGET", ""),
 		AuditShipAllowLegacyHashMismatch: envBool("MULTICODEX_AUDIT_SHIP_ALLOW_LEGACY_HASH_MISMATCH", false),
 		GitSyncMode:                      env("MULTICODEX_GIT_SYNC_MODE", "dry-run"),
+		GitSyncLiveReviewed:              envBool("MULTICODEX_GIT_SYNC_LIVE_REVIEWED", false),
 		GitCredentialProvider:            env("MULTICODEX_GIT_CREDENTIAL_PROVIDER", "env"),
 		GitCredentialFilePath:            env("MULTICODEX_GIT_CREDENTIAL_FILE_PATH", ""),
 		GitVaultAddress:                  env("MULTICODEX_GIT_VAULT_ADDR", ""),
@@ -190,6 +220,18 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	return parsed
 }
 
+func envInt(key string, fallback int) int {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
 func envList(key string) []string {
 	value := os.Getenv(key)
 	if value == "" {
@@ -197,6 +239,27 @@ func envList(key string) []string {
 	}
 	parts := strings.FieldsFunc(value, func(r rune) bool {
 		return r == ',' || r == ';' || r == '\n' || r == '\t' || r == ' '
+	})
+	values := make([]string, 0, len(parts))
+	seen := map[string]bool{}
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || seen[part] {
+			continue
+		}
+		values = append(values, part)
+		seen[part] = true
+	}
+	return values
+}
+
+func envCommandList(key string, fallback []string) []string {
+	value := os.Getenv(key)
+	if value == "" {
+		return append([]string(nil), fallback...)
+	}
+	parts := strings.FieldsFunc(value, func(r rune) bool {
+		return r == ';' || r == '\n' || r == '\t'
 	})
 	values := make([]string, 0, len(parts))
 	seen := map[string]bool{}
@@ -236,4 +299,23 @@ func envClaimMappings(key string) []authn.ClaimMapping {
 		mappings = append(mappings, authn.ClaimMapping{Claim: claim, Value: mapped})
 	}
 	return mappings
+}
+
+func defaultWorkerCommandDenylist() []string {
+	return []string{
+		"rm -rf /",
+		"docker",
+		"podman",
+		"kubectl",
+		"terraform apply",
+		"terraform destroy",
+		"git push",
+		"gh pr merge",
+		"curl http://169.254.169.254",
+		"wget http://169.254.169.254",
+		"ssh",
+		"scp",
+		"sudo",
+		"su",
+	}
 }

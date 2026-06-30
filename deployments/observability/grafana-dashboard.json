@@ -1,0 +1,91 @@
+{
+  "title": "multi-codex Operations",
+  "uid": "multi-codex-ops",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "tags": ["multi-codex", "operations"],
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "HTTP Error Rate",
+      "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (service) (rate(multi_codex_http_request_errors_total[5m])) / clamp_min(sum by (service) (rate(multi_codex_http_requests_total[5m])), 1)",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "HTTP p95 Latency",
+      "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, service) (rate(multi_codex_http_request_duration_seconds_bucket[5m])))",
+          "legendFormat": "{{service}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Queue Depth",
+      "gridPos": {"x": 0, "y": 8, "w": 8, "h": 6},
+      "targets": [
+        {
+          "expr": "sum(multi_codex_queue_depth)",
+          "legendFormat": "queued"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Worker Terminal Failures",
+      "gridPos": {"x": 8, "y": 8, "w": 8, "h": 6},
+      "targets": [
+        {
+          "expr": "sum(multi_codex_worker_terminal_failures{status=~\"failed|timed_out|blocked\"})",
+          "legendFormat": "terminal failures"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Audit Ship Failures",
+      "gridPos": {"x": 16, "y": 8, "w": 8, "h": 6},
+      "targets": [
+        {
+          "expr": "increase(multi_codex_audit_action_total{action=\"api.audit_ship_failed\"}[24h])",
+          "legendFormat": "24h failures"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Runs By Status",
+      "gridPos": {"x": 0, "y": 14, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "sum by (status) (multi_codex_runs_total)",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Completed Run Duration p95",
+      "gridPos": {"x": 12, "y": 14, "w": 12, "h": 8},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, role, executor) (rate(multi_codex_run_duration_seconds_bucket[15m])))",
+          "legendFormat": "{{role}} {{executor}}"
+        }
+      ]
+    }
+  ]
+}

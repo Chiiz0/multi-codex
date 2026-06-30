@@ -48,6 +48,10 @@ func TestBuildStateFullGatePath(t *testing.T) {
 
 	gitPublishRun, _ := st.StartRun(task.ID, "git_sync", "docker")
 	_, _ = st.FinishRun(gitPublishRun.ID, "succeeded", map[string]any{"status": "publish_prepared"})
+	assertNextAction(t, BuildState(st, mustTask(t, st, task.ID)), "git_publish_pr")
+
+	liveGitPublishRun, _ := st.StartRun(task.ID, "git_sync", "docker")
+	_, _ = st.FinishRun(liveGitPublishRun.ID, "succeeded", map[string]any{"status": "published"})
 	assertNextAction(t, BuildState(st, mustTask(t, st, task.ID)), "completed")
 }
 

@@ -36,6 +36,19 @@ func TestFromEnvParsesRetentionConfig(t *testing.T) {
 	t.Setenv("MULTICODEX_AUDIT_SEAL_ROOT", "/var/lib/multi-codex/audit-seals")
 	t.Setenv("MULTICODEX_AUDIT_SHIP_TARGET", "file:///worm/multi-codex")
 	t.Setenv("MULTICODEX_AUDIT_SHIP_ALLOW_LEGACY_HASH_MISMATCH", "true")
+	t.Setenv("MULTICODEX_WORKER_CPUS", "2")
+	t.Setenv("MULTICODEX_WORKER_MEMORY", "4g")
+	t.Setenv("MULTICODEX_WORKER_PIDS_LIMIT", "512")
+	t.Setenv("MULTICODEX_WORKER_READ_ONLY_ROOTFS", "true")
+	t.Setenv("MULTICODEX_WORKER_TMPFS_SIZE", "512m")
+	t.Setenv("MULTICODEX_WORKER_NO_NEW_PRIVILEGES", "true")
+	t.Setenv("MULTICODEX_WORKER_CAP_DROP", "ALL;NET_RAW")
+	t.Setenv("MULTICODEX_WORKER_COMMAND_ALLOWLIST", "go test ./...;pnpm --dir apps/web build")
+	t.Setenv("MULTICODEX_WORKER_COMMAND_DENYLIST", "docker;git push")
+	t.Setenv("MULTICODEX_WORKER_DOCKER_SOCKET_ENABLED", "true")
+	t.Setenv("MULTICODEX_WORKER_DOCKER_SOCKET_BOUNDARY", "isolated-worker-host")
+	t.Setenv("MULTICODEX_GIT_SYNC_MODE", "live")
+	t.Setenv("MULTICODEX_GIT_SYNC_LIVE_REVIEWED", "true")
 
 	cfg := FromEnv()
 	if !cfg.RetentionEnabled {
@@ -121,6 +134,27 @@ func TestFromEnvParsesRetentionConfig(t *testing.T) {
 	}
 	if !cfg.AuditShipAllowLegacyHashMismatch {
 		t.Fatalf("audit ship legacy mismatch compatibility should be enabled")
+	}
+	if cfg.WorkerCPUs != "2" || cfg.WorkerMemory != "4g" || cfg.WorkerPidsLimit != 512 {
+		t.Fatalf("worker resource config = %#v", cfg)
+	}
+	if !cfg.WorkerReadOnlyRootFS || cfg.WorkerTmpfsSize != "512m" || !cfg.WorkerNoNewPrivileges {
+		t.Fatalf("worker isolation config = %#v", cfg)
+	}
+	if len(cfg.WorkerCapDrop) != 2 || cfg.WorkerCapDrop[0] != "ALL" || cfg.WorkerCapDrop[1] != "NET_RAW" {
+		t.Fatalf("worker cap drop = %#v", cfg.WorkerCapDrop)
+	}
+	if len(cfg.WorkerCommandAllowlist) != 2 || cfg.WorkerCommandAllowlist[0] != "go test ./..." {
+		t.Fatalf("worker command allowlist = %#v", cfg.WorkerCommandAllowlist)
+	}
+	if len(cfg.WorkerCommandDenylist) != 2 || cfg.WorkerCommandDenylist[1] != "git push" {
+		t.Fatalf("worker command denylist = %#v", cfg.WorkerCommandDenylist)
+	}
+	if !cfg.WorkerDockerSocketEnabled || cfg.WorkerDockerSocketBoundary != "isolated-worker-host" {
+		t.Fatalf("worker docker socket boundary = %#v", cfg)
+	}
+	if cfg.GitSyncMode != "live" || !cfg.GitSyncLiveReviewed {
+		t.Fatalf("git sync live config = %#v", cfg)
 	}
 }
 

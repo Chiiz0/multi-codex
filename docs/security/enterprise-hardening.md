@@ -20,12 +20,13 @@
 - Optional Bearer-token protection for HTTP worker-agentd run intake and remote result/log collection.
 - Audit log records for important API and MCP decisions.
 - Worker audit records for local, Docker, SSH, timeout, error, and secret environment decisions.
+- Worker command, resource, network, dependency, and scope policy decisions with run events and audit records.
 - Queue audit records for capacity enqueue, queue dispatch, dispatch failure, dispatch capacity block, and worker retry enqueue decisions.
 - Postgres-backed audit hash chain for new audit rows, serialized with a transaction advisory lock.
 - `mcxctl audit-verify` for offline audit hash-chain verification against PostgreSQL.
 - `mcxctl audit-seal` for verified WORM/SIEM handoff bundles.
 - Artifact content read audit logs, including trace id, artifact kind, path, content type, and truncation status.
-- Secret-keyword redaction for executor error output.
+- Structured secret redaction for executor error output, common token formats, private keys, and keyword assignment patterns.
 - Configured worker secret value redaction for Docker worker logs, result files, diffs, and Docker output events.
 - Scoped Docker worker secret-env injection from Agent Profile `config.worker_secret_env` plus deployment allowlist.
 - Git Sync provider token resolution through env, file, or Vault sources without persisting token values.
@@ -197,6 +198,17 @@ MULTICODEX_GIT_VAULT_SECRET_PATH=multi-codex/git
 
 API and MCP `git_publish_pr` events record `credential_provider` and `credential_resolved`. Provider response errors are redacted before they are returned or persisted. Auto-merge remains disabled.
 
+Production live PR creation is fail-closed behind the pilot review flag:
+
+```bash
+MULTICODEX_GIT_SYNC_MODE=live
+MULTICODEX_GIT_SYNC_LIVE_REVIEWED=true
+```
+
+Without that explicit review acknowledgement, API and MCP Gateway refuse to
+start in production live mode. The workflow still requires the task-level
+`pr_publish` approval before any provider PR call is made.
+
 ## Artifact Retention
 
 Artifacts store metadata, filesystem paths, and hashes where available. The API exposes textual artifact content through `GET /api/v1/artifacts/{artifact_id}/content` with a 2 MiB response cap and emits an `api.artifact_read` audit record for successful reads. Memory-backed artifacts, such as prepared PR bodies, are read from artifact metadata. Web Console live run events use `GET /api/v1/runs/{run_id}/events/stream`; stream lifecycle decisions emit `api.run_event_stream_open` and `api.run_event_stream_close`.
@@ -284,6 +296,7 @@ Implemented now:
 - OpenTelemetry-compatible JSON metric export through `?format=otlp` or `Accept: application/x-otlp-json`.
 - Dynamic URL segment normalization for metrics labels.
 - Store-derived run count, active-run, and run-duration metrics grouped by role, executor, and status.
+- Operational Prometheus metrics for queue depth, worker terminal failures, audit ship, retention cleanup, and telemetry push failures.
 - Prometheus and OTLP-compatible histogram buckets for HTTP request duration and completed worker run duration.
 - Optional OTLP JSON push from API and MCP Gateway through `MULTICODEX_TELEMETRY_PUSH_URL`.
 - `X-Multi-Codex-Trace-Id` response header.

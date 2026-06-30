@@ -34,6 +34,7 @@ type Server struct {
 }
 
 type actorContextKey struct{}
+type mcpAuthContextKey struct{}
 
 type Tool struct {
 	Name        string         `json:"name"`
@@ -104,11 +105,15 @@ func (s *Server) metricsEndpoint(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(s.metrics.PrometheusText()))
-		_, _ = w.Write([]byte(observability.RunsPrometheusText("multi-codex-mcp-gateway", s.store.ListAllRuns())))
+		runs := s.store.ListAllRuns()
+		_, _ = w.Write([]byte(observability.RunsPrometheusText("multi-codex-mcp-gateway", runs)))
+		_, _ = w.Write([]byte(observability.OperationsPrometheusText("multi-codex-mcp-gateway", runs, s.store.ListAuditLogs())))
 		return
 	}
 	snapshot := s.metrics.Snapshot()
-	snapshot["runs"] = observability.RunMetricsSnapshot(s.store.ListAllRuns())
+	runs := s.store.ListAllRuns()
+	snapshot["runs"] = observability.RunMetricsSnapshot(runs)
+	snapshot["operations"] = observability.OperationsSnapshot(runs, s.store.ListAuditLogs())
 	writeJSON(w, http.StatusOK, snapshot)
 }
 
@@ -170,7 +175,10 @@ func (s *Server) recordTelemetryPushFailure(trigger string, payload map[string]a
 func (s *Server) withAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.EqualFold(s.cfg.AuthMode, "oidc") || r.URL.Path == "/healthz" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r)
+			authCtx := s.store.GetAuthContext()
+			ctx := context.WithValue(r.Context(), actorContextKey{}, authCtx.User.ID)
+			ctx = context.WithValue(ctx, mcpAuthContextKey{}, authCtx)
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
 		if s.oidc == nil {
@@ -262,6 +270,7 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 			},
 		})
 		ctx := context.WithValue(r.Context(), actorContextKey{}, authCtx.User.ID)
+		ctx = context.WithValue(ctx, mcpAuthContextKey{}, authCtx)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -747,13 +756,182 @@ func sessionAuditPayload(session domain.MCPSession, extra map[string]any) map[st
 	return payload
 }
 
+func (s *Server) authorizeTool(ctx context.Context, name string, inputRaw json.RawMessage) (any, int, bool) {
+	required := toolPermission(name)
+	auth := s.authContext(ctx)
+	if required != "" && !hasPermission(auth.Permissions, required) {
+		return s.denyTool(ctx, name, inputRaw, required, "tool", name, auth.Membership.OrgID), http.StatusForbidden, false
+	}
+
+	switch name {
+	case "policy_validate_task", "task_create":
+		var input struct {
+			TaskEnvelope domain.TaskEnvelope `json:"task_envelope"`
+		}
+		if err := decodeToolInput(inputRaw, &input); err != nil {
+			return nil, 0, true
+		}
+		if input.TaskEnvelope.ProjectID == "" {
+			return nil, 0, true
+		}
+		if ok, resourceOrg := s.canAccessProject(ctx, input.TaskEnvelope.ProjectID); !ok {
+			return s.denyTool(ctx, name, inputRaw, required, "project", input.TaskEnvelope.ProjectID, resourceOrg), http.StatusForbidden, false
+		}
+	case "task_list":
+		var input struct {
+			ProjectID string `json:"project_id"`
+		}
+		if err := decodeToolInput(inputRaw, &input); err != nil {
+			return nil, 0, true
+		}
+		if ok, resourceOrg := s.canAccessProject(ctx, input.ProjectID); !ok {
+			return s.denyTool(ctx, name, inputRaw, required, "project", input.ProjectID, resourceOrg), http.StatusForbidden, false
+		}
+	case "task_get", "worker_spawn", "repo_scope_check", "test_run_required", "audit_run", "approval_request", "approval_status", "git_prepare_pr", "git_publish_pr":
+		taskID := toolTaskID(inputRaw)
+		if taskID == "" {
+			return nil, 0, true
+		}
+		if ok, resourceOrg := s.canAccessTask(ctx, taskID); !ok {
+			return s.denyTool(ctx, name, inputRaw, required, "task", taskID, resourceOrg), http.StatusForbidden, false
+		}
+	case "worker_status", "worker_logs", "worker_result":
+		runID := toolRunID(inputRaw)
+		if runID == "" {
+			return nil, 0, true
+		}
+		if ok, resourceOrg := s.canAccessRun(ctx, runID); !ok {
+			return s.denyTool(ctx, name, inputRaw, required, "run", runID, resourceOrg), http.StatusForbidden, false
+		}
+	}
+	return nil, 0, true
+}
+
+func toolPermission(name string) string {
+	switch name {
+	case "organization_list":
+		return "organizations:read"
+	case "organization_create":
+		return "organizations:write"
+	case "policy_validate_task", "task_create", "repo_scope_check":
+		return "tasks:write"
+	case "task_list", "task_get", "approval_status":
+		return "tasks:read"
+	case "worker_spawn", "worker_result", "queue_dispatch", "test_run_required", "audit_run", "git_prepare_pr", "git_publish_pr":
+		return "runs:write"
+	case "worker_status", "worker_logs", "queue_status":
+		return "runs:read"
+	case "approval_request":
+		return "approvals:write"
+	default:
+		return ""
+	}
+}
+
+func (s *Server) authContext(ctx context.Context) domain.AuthContext {
+	if auth, ok := ctx.Value(mcpAuthContextKey{}).(domain.AuthContext); ok {
+		return auth
+	}
+	return s.store.GetAuthContext()
+}
+
+func (s *Server) canAccessProject(ctx context.Context, projectID string) (bool, string) {
+	project, err := s.store.GetProject(projectID)
+	if err != nil {
+		return true, ""
+	}
+	auth := s.authContext(ctx)
+	return project.OrgID == "" || auth.Membership.OrgID == "" || project.OrgID == auth.Membership.OrgID, project.OrgID
+}
+
+func (s *Server) canAccessTask(ctx context.Context, taskID string) (bool, string) {
+	task, err := s.store.GetTask(taskID)
+	if err != nil {
+		return true, ""
+	}
+	return s.canAccessProject(ctx, task.ProjectID)
+}
+
+func (s *Server) canAccessRun(ctx context.Context, runID string) (bool, string) {
+	run, err := s.store.GetRun(runID)
+	if err != nil {
+		return true, ""
+	}
+	return s.canAccessTask(ctx, run.TaskID)
+}
+
+func (s *Server) organizationsForAuth(ctx context.Context) []domain.Organization {
+	auth := s.authContext(ctx)
+	orgs := []domain.Organization{}
+	for _, org := range s.store.ListOrganizations() {
+		if org.ID == auth.Membership.OrgID || auth.Membership.OrgID == "" {
+			orgs = append(orgs, org)
+		}
+	}
+	return orgs
+}
+
+func (s *Server) denyTool(ctx context.Context, name string, inputRaw json.RawMessage, requiredPermission string, resourceType string, resourceID string, resourceOrgID string) map[string]any {
+	auth := s.authContext(ctx)
+	output := map[string]any{"error": "permission denied"}
+	s.recordTool(ctx, name, inputRaw, output, "blocked", resourceType, resourceID)
+	s.store.RecordAuditLog(domain.AuditLog{
+		OrgID:        auth.Membership.OrgID,
+		ActorType:    "codex",
+		ActorID:      mcpActorID(ctx),
+		Action:       "mcp.authorization_denied",
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		Payload: map[string]any{
+			"tool_name":           name,
+			"required_permission": requiredPermission,
+			"actor_org_id":        auth.Membership.OrgID,
+			"resource_org_id":     resourceOrgID,
+			"trace_id":            observability.TraceID(ctx),
+		},
+	})
+	return output
+}
+
+func hasPermission(permissions []string, required string) bool {
+	for _, permission := range permissions {
+		if permission == "*" || permission == required {
+			return true
+		}
+	}
+	return false
+}
+
+func toolTaskID(inputRaw json.RawMessage) string {
+	var input struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := decodeToolInput(inputRaw, &input); err != nil {
+		return ""
+	}
+	return input.TaskID
+}
+
+func toolRunID(inputRaw json.RawMessage) string {
+	var input struct {
+		RunID string `json:"run_id"`
+	}
+	if err := decodeToolInput(inputRaw, &input); err != nil {
+		return ""
+	}
+	return input.RunID
+}
+
 func (s *Server) invokeTool(ctx context.Context, name string, inputRaw json.RawMessage) (any, int) {
 	if len(inputRaw) == 0 {
 		inputRaw = []byte(`{}`)
 	}
+	if output, status, ok := s.authorizeTool(ctx, name, inputRaw); !ok {
+		return output, status
+	}
 	switch name {
 	case "organization_list":
-		output := map[string]any{"organizations": s.store.ListOrganizations()}
+		output := map[string]any{"organizations": s.organizationsForAuth(ctx)}
 		s.recordTool(ctx, name, inputRaw, output, "succeeded", "organization", "")
 		return output, http.StatusOK
 	case "organization_create":
@@ -943,6 +1121,24 @@ func (s *Server) invokeTool(ctx context.Context, name string, inputRaw json.RawM
 		s.recordTool(ctx, name, inputRaw, output, "succeeded", "queue", "runs")
 		return output, http.StatusOK
 	case "queue_dispatch":
+		if strings.EqualFold(s.cfg.AuthMode, "oidc") {
+			output := map[string]any{"error": "manual queue dispatch is disabled in multi-organization mode"}
+			s.recordTool(ctx, name, inputRaw, output, "blocked", "queue", "runs")
+			s.store.RecordAuditLog(domain.AuditLog{
+				OrgID:        s.authContext(ctx).Membership.OrgID,
+				ActorType:    "codex",
+				ActorID:      mcpActorID(ctx),
+				Action:       "mcp.authorization_denied",
+				ResourceType: "queue",
+				ResourceID:   "runs",
+				Payload: map[string]any{
+					"tool_name": name,
+					"reason":    "manual_dispatch_disabled_in_multi_org_mode",
+					"trace_id":  observability.TraceID(ctx),
+				},
+			})
+			return output, http.StatusForbidden
+		}
 		run, err := s.dispatchOneQueuedRun(ctx, "manual")
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
@@ -1226,6 +1422,7 @@ func (s *Server) publishPR(ctx context.Context, name string, inputRaw json.RawMe
 }
 
 func (s *Server) recordTool(ctx context.Context, name string, input json.RawMessage, output any, status string, resourceType string, resourceID string) {
+	auth := s.authContext(ctx)
 	s.store.RecordToolCall(domain.ToolCall{
 		Caller:   "mcp-gateway",
 		ToolName: name,
@@ -1234,6 +1431,7 @@ func (s *Server) recordTool(ctx context.Context, name string, input json.RawMess
 		Status:   status,
 	})
 	s.store.RecordAuditLog(domain.AuditLog{
+		OrgID:        auth.Membership.OrgID,
 		ActorType:    "codex",
 		ActorID:      mcpActorID(ctx),
 		Action:       "mcp_tool." + name,

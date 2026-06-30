@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +83,9 @@ func (m *Manager) Start(ctx context.Context, task domain.Task, run domain.Run) {
 func (m *Manager) execute(ctx context.Context, task domain.Task, run domain.Run, timeout time.Duration) {
 	if timeout > 0 {
 		_, _ = m.store.AddEvent(run.ID, "info", "executor_timeout_policy", "Worker timeout policy applied", timeoutPayload(timeout))
+	}
+	if m.enforceWorkerPlanPolicy(task, run) {
+		return
 	}
 	rc, err := m.prepareRun(ctx, task, run)
 	if err != nil {
@@ -351,9 +355,47 @@ func (m *Manager) runLocalLifecycle(ctx context.Context, task domain.Task, run d
 	return err
 }
 
+func (m *Manager) enforceWorkerPlanPolicy(task domain.Task, run domain.Run) bool {
+	result := policy.CheckCommandPolicy(task.Envelope.AllowedCommands, m.cfg.WorkerCommandAllowlist, m.cfg.WorkerCommandDenylist)
+	payload := map[string]any{
+		"status":           result.Status,
+		"allowed_commands": result.AllowedCommands,
+		"violations":       result.Violations,
+		"allowlist_active": result.AllowlistActive,
+	}
+	level := "info"
+	message := "Worker command policy passed"
+	if result.Status == "blocked" {
+		level = "warn"
+		message = "Worker command policy blocked execution"
+	}
+	_, _ = m.store.AddEvent(run.ID, level, "worker_command_policy", message, payload)
+	m.auditWorker(run.ID, "worker.command_policy", "run", run.ID, payload)
+	if result.Status != "blocked" {
+		return false
+	}
+	_, _ = m.store.UpdateTaskStatus(task.ID, "blocked")
+	_, _ = m.store.FinishRun(run.ID, "blocked", map[string]any{
+		"status":     "blocked",
+		"policy":     "worker_command_policy",
+		"violations": result.Violations,
+	})
+	return true
+}
+
 func (m *Manager) runDocker(ctx context.Context, task domain.Task, run domain.Run, rc runContext) error {
 	containerName := "multi-codex-" + safePathComponent(run.ID)
 	networkMode := dockerNetworkMode(task)
+	resourcePolicy := m.workerResourcePolicy(task)
+	resourcePayload := resourcePolicy.payload()
+	_, _ = m.store.AddEvent(run.ID, "info", "worker_resource_policy", "Docker worker resource and filesystem limits applied", resourcePayload)
+	m.auditWorker(run.ID, "worker.resource_policy", "run", run.ID, resourcePayload)
+	networkPayload := map[string]any{
+		"requested": task.Envelope.Network,
+		"mode":      networkMode,
+	}
+	_, _ = m.store.AddEvent(run.ID, "info", "worker_network_policy", "Docker worker network policy applied", networkPayload)
+	m.auditWorker(run.ID, "worker.network_policy", "run", run.ID, networkPayload)
 	secretPlan := m.workerSecretEnvPlan(task)
 	if len(secretPlan.Requested) > 0 || len(secretPlan.Injected) > 0 || len(secretPlan.Skipped) > 0 {
 		payload := map[string]any{
@@ -366,23 +408,7 @@ func (m *Manager) runDocker(ctx context.Context, task domain.Task, run domain.Ru
 		m.auditWorker(run.ID, "worker.secret_env_decision", "run", run.ID, payload)
 	}
 	command := dockerWorkerCommand(task, run)
-	args := []string{
-		"run", "--rm",
-		"--name", containerName,
-		"--network", networkMode,
-		"-v", rc.RunDir + ":/runs",
-		"-v", rc.Workspace + ":/workspace",
-		"-e", "MULTICODEX_RUN_ID=" + run.ID,
-		"-e", "MULTICODEX_TASK_ID=" + task.ID,
-		"-e", "MULTICODEX_ROLE=" + run.Role,
-	}
-	for _, name := range secretPlan.Injected {
-		args = append(args, "-e", name)
-	}
-	args = append(args,
-		m.cfg.WorkerImage,
-		"bash", "-lc", command,
-	)
+	args := dockerRunArgs(m.cfg, task, run, rc, containerName, networkMode, resourcePolicy, secretPlan.Injected, command)
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	output, err := cmd.CombinedOutput()
 	m.redactRunFiles(rc.RunDir, secretPlan.Values)
@@ -443,6 +469,121 @@ func dockerRunAuditStatus(ctx context.Context, err error) string {
 		return "timed_out"
 	}
 	return "failed"
+}
+
+type dockerResourcePolicy struct {
+	CPUs            string
+	Memory          string
+	PidsLimit       int
+	ReadOnlyRootFS  bool
+	TmpfsSize       string
+	NoNewPrivileges bool
+	CapDrop         []string
+}
+
+func (p dockerResourcePolicy) payload() map[string]any {
+	return map[string]any{
+		"cpus":               p.CPUs,
+		"memory":             p.Memory,
+		"pids_limit":         p.PidsLimit,
+		"read_only_rootfs":   p.ReadOnlyRootFS,
+		"tmpfs_size":         p.TmpfsSize,
+		"no_new_privileges":  p.NoNewPrivileges,
+		"cap_drop":           p.CapDrop,
+		"filesystem_mounts":  []string{"/runs:rw", "/workspace:rw", "/tmp:tmpfs", "/home/codex:tmpfs"},
+		"executor_isolation": "docker",
+	}
+}
+
+func (m *Manager) workerResourcePolicy(task domain.Task) dockerResourcePolicy {
+	policy := dockerResourcePolicy{
+		CPUs:            m.cfg.WorkerCPUs,
+		Memory:          m.cfg.WorkerMemory,
+		PidsLimit:       m.cfg.WorkerPidsLimit,
+		ReadOnlyRootFS:  m.cfg.WorkerReadOnlyRootFS,
+		TmpfsSize:       m.cfg.WorkerTmpfsSize,
+		NoNewPrivileges: m.cfg.WorkerNoNewPrivileges,
+		CapDrop:         append([]string(nil), m.cfg.WorkerCapDrop...),
+	}
+	for _, profile := range m.store.ListAgentProfiles(task.ProjectID) {
+		if profile.Name != task.Envelope.AgentProfile && profile.ID != task.Envelope.AgentProfile {
+			continue
+		}
+		cfg := profile.Config
+		if nested, ok := cfg["worker_resources"].(map[string]any); ok {
+			cfg = mergeConfigMaps(cfg, nested)
+		}
+		if value := stringFromConfigMap(cfg, "worker_cpus", "cpus", "cpu_limit"); value != "" {
+			policy.CPUs = value
+		}
+		if value := stringFromConfigMap(cfg, "worker_memory", "memory", "memory_limit"); value != "" {
+			policy.Memory = value
+		}
+		if value := intFromConfigMapAnyKey(cfg, 0, "worker_pids_limit", "pids_limit"); value > 0 {
+			policy.PidsLimit = value
+		}
+		if value, ok := boolFromConfigMapAnyKey(cfg, "worker_read_only_rootfs", "read_only_rootfs"); ok {
+			policy.ReadOnlyRootFS = value
+		}
+		if value := stringFromConfigMap(cfg, "worker_tmpfs_size", "tmpfs_size"); value != "" {
+			policy.TmpfsSize = value
+		}
+		return policy
+	}
+	return policy
+}
+
+func dockerRunArgs(cfg config.Config, task domain.Task, run domain.Run, rc runContext, containerName string, networkMode string, resourcePolicy dockerResourcePolicy, injectedEnv []string, command string) []string {
+	args := []string{
+		"run", "--rm",
+		"--name", containerName,
+		"--network", networkMode,
+		"--workdir", "/workspace",
+	}
+	if strings.TrimSpace(resourcePolicy.CPUs) != "" {
+		args = append(args, "--cpus", resourcePolicy.CPUs)
+	}
+	if strings.TrimSpace(resourcePolicy.Memory) != "" {
+		args = append(args, "--memory", resourcePolicy.Memory)
+	}
+	if resourcePolicy.PidsLimit > 0 {
+		args = append(args, "--pids-limit", strconv.Itoa(resourcePolicy.PidsLimit))
+	}
+	if resourcePolicy.NoNewPrivileges {
+		args = append(args, "--security-opt", "no-new-privileges")
+	}
+	for _, cap := range resourcePolicy.CapDrop {
+		cap = strings.TrimSpace(cap)
+		if cap != "" {
+			args = append(args, "--cap-drop", cap)
+		}
+	}
+	if resourcePolicy.ReadOnlyRootFS {
+		args = append(args, "--read-only")
+		tmpfsSize := resourcePolicy.TmpfsSize
+		if strings.TrimSpace(tmpfsSize) == "" {
+			tmpfsSize = "256m"
+		}
+		args = append(args,
+			"--tmpfs", "/tmp:rw,noexec,nosuid,size="+tmpfsSize,
+			"--tmpfs", "/home/codex:rw,nosuid,size="+tmpfsSize,
+		)
+	}
+	args = append(args,
+		"-v", rc.RunDir+":/runs:rw",
+		"-v", rc.Workspace+":/workspace:rw",
+		"-e", "MULTICODEX_RUN_ID="+run.ID,
+		"-e", "MULTICODEX_TASK_ID="+task.ID,
+		"-e", "MULTICODEX_ROLE="+run.Role,
+	)
+	for _, name := range injectedEnv {
+		args = append(args, "-e", name)
+	}
+	args = append(args,
+		cfg.WorkerImage,
+		"bash", "-lc", command,
+	)
+	return args
 }
 
 func (m *Manager) workerSecretEnvPlan(task domain.Task) workerSecretEnvPlan {
@@ -889,6 +1030,24 @@ func (m *Manager) collectArtifactsAndScope(ctx context.Context, task domain.Task
 	}
 
 	changedFiles := gitChangedFiles(ctx, rc.Workspace)
+	dependencyResult := policy.CheckDependencyPolicy(changedFiles, task.Envelope.Policy.AllowDependencyChange)
+	dependencyPayload := map[string]any{
+		"status":                  dependencyResult.Status,
+		"allow_dependency_change": dependencyResult.AllowDependencyChange,
+		"changed_files":           dependencyResult.ChangedFiles,
+		"violations":              dependencyResult.Violations,
+	}
+	dependencyLevel := "info"
+	dependencyMessage := "Dependency and lockfile policy passed"
+	if dependencyResult.Status == "blocked" {
+		dependencyLevel = "warn"
+		dependencyMessage = "Dependency and lockfile policy blocked task"
+	}
+	_, _ = m.store.AddEvent(run.ID, dependencyLevel, "dependency_policy", dependencyMessage, dependencyPayload)
+	m.auditWorker(run.ID, "worker.dependency_policy", "run", run.ID, dependencyPayload)
+	if dependencyResult.Status == "blocked" {
+		_, _ = m.store.UpdateTaskStatus(task.ID, "blocked")
+	}
 	if len(changedFiles) == 0 {
 		return nil
 	}
@@ -898,6 +1057,12 @@ func (m *Manager) collectArtifactsAndScope(ctx context.Context, task domain.Task
 		return err
 	}
 	_, _ = m.store.AddEvent(run.ID, "info", "scope_check", "Scope check recorded from git diff", map[string]any{
+		"scope_check_id": record.ID,
+		"status":         result.Status,
+		"changed_files":  result.ChangedFiles,
+		"violations":     result.Violations,
+	})
+	m.auditWorker(run.ID, "worker.scope_check", "run", run.ID, map[string]any{
 		"scope_check_id": record.ID,
 		"status":         result.Status,
 		"changed_files":  result.ChangedFiles,
@@ -1064,6 +1229,51 @@ func intFromResult(values map[string]any, key string, fallback int) int {
 	return intFromConfigMap(values, key, fallback)
 }
 
+func mergeConfigMaps(base map[string]any, override map[string]any) map[string]any {
+	merged := map[string]any{}
+	for key, value := range base {
+		merged[key] = value
+	}
+	for key, value := range override {
+		merged[key] = value
+	}
+	return merged
+}
+
+func stringFromConfigMap(values map[string]any, keys ...string) string {
+	if values == nil {
+		return ""
+	}
+	for _, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		case json.Number:
+			return typed.String()
+		case int:
+			return strconv.Itoa(typed)
+		case int64:
+			return strconv.FormatInt(typed, 10)
+		case float64:
+			return strconv.FormatFloat(typed, 'f', -1, 64)
+		}
+	}
+	return ""
+}
+
+func intFromConfigMapAnyKey(values map[string]any, fallback int, keys ...string) int {
+	for _, key := range keys {
+		if value := intFromConfigMap(values, key, 0); value > 0 {
+			return value
+		}
+	}
+	return fallback
+}
+
 func intFromConfigMap(values map[string]any, key string, fallback int) int {
 	if values == nil {
 		return fallback
@@ -1091,6 +1301,28 @@ func intFromConfigMap(values map[string]any, key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func boolFromConfigMapAnyKey(values map[string]any, keys ...string) (bool, bool) {
+	if values == nil {
+		return false, false
+	}
+	for _, key := range keys {
+		value, ok := values[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case bool:
+			return typed, true
+		case string:
+			parsed, err := strconv.ParseBool(strings.TrimSpace(typed))
+			if err == nil {
+				return parsed, true
+			}
+		}
+	}
+	return false, false
 }
 
 func timeoutPayload(timeout time.Duration) map[string]any {
@@ -1246,9 +1478,23 @@ func safePathComponent(value string) string {
 	return value
 }
 
+var structuredSecretDetectors = []*regexp.Regexp{
+	regexp.MustCompile(`(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----`),
+	regexp.MustCompile(`(?i)\bsk-[a-z0-9][a-z0-9_-]{16,}`),
+	regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9_]{20,}`),
+	regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{20,}`),
+	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+	regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{20,}`),
+	regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`),
+	regexp.MustCompile(`(?i)\b(secret|token|password|credential|api[_-]?key)\b\s*[:=]\s*["']?[^ \n\r\t"']+`),
+}
+
 func redact(value string) string {
 	replacements := []string{"secret", "token", "password", "credential", "api_key"}
 	redacted := value
+	for _, detector := range structuredSecretDetectors {
+		redacted = detector.ReplaceAllString(redacted, "[redacted-secret]")
+	}
 	for _, needle := range replacements {
 		redacted = strings.ReplaceAll(redacted, needle, "[redacted-keyword]")
 		redacted = strings.ReplaceAll(redacted, strings.ToUpper(needle), "[redacted-keyword]")

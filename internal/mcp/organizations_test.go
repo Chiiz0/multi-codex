@@ -29,8 +29,11 @@ func TestOrganizationToolsCreateAndList(t *testing.T) {
 	result = listResp["result"].(map[string]any)
 	structured = result["structuredContent"].(map[string]any)
 	orgs := structured["organizations"].([]any)
-	if len(orgs) < 2 {
-		t.Fatalf("expected seeded and created orgs, got %#v", orgs)
+	if len(orgs) != 1 {
+		t.Fatalf("expected only current organization, got %#v", orgs)
+	}
+	if orgs[0].(map[string]any)["slug"] != "default" {
+		t.Fatalf("expected default org only, got %#v", orgs)
 	}
 
 	var audited bool

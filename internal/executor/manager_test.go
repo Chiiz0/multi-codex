@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -100,6 +101,129 @@ func TestDockerNetworkModeRequiresTaskNetworkFlag(t *testing.T) {
 	task.Envelope.Network = true
 	if got := dockerNetworkMode(task); got != "bridge" {
 		t.Fatalf("network mode with network flag = %q", got)
+	}
+}
+
+func TestDockerRunArgsApplyIsolationLimits(t *testing.T) {
+	args := dockerRunArgs(
+		config.Config{WorkerImage: "multi-codex/codex-worker:test"},
+		domain.Task{ID: "task_1"},
+		domain.Run{ID: "run_1", Role: "feature"},
+		runContext{RunDir: "/runs/run_1", Workspace: "/worktrees/run_1"},
+		"multi-codex-run_1",
+		"none",
+		dockerResourcePolicy{
+			CPUs:            "1.5",
+			Memory:          "1536m",
+			PidsLimit:       128,
+			ReadOnlyRootFS:  true,
+			TmpfsSize:       "64m",
+			NoNewPrivileges: true,
+			CapDrop:         []string{"ALL"},
+		},
+		[]string{"OPENAI_API_KEY"},
+		"echo ok",
+	)
+	joined := strings.Join(args, " ")
+	for _, want := range []string{
+		"--network none",
+		"--cpus 1.5",
+		"--memory 1536m",
+		"--pids-limit 128",
+		"--security-opt no-new-privileges",
+		"--cap-drop ALL",
+		"--read-only",
+		"--tmpfs /tmp:rw,noexec,nosuid,size=64m",
+		"--tmpfs /home/codex:rw,nosuid,size=64m",
+		"-v /runs/run_1:/runs:rw",
+		"-v /worktrees/run_1:/workspace:rw",
+		"-e OPENAI_API_KEY",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("docker args missing %q: %#v", want, args)
+		}
+	}
+}
+
+func TestWorkerResourcePolicyCanUseProfileOverrides(t *testing.T) {
+	st := store.NewMemoryStore()
+	_, err := st.CreateAgentProfile(domain.AgentProfile{
+		ProjectID: "proj_demo",
+		Name:      "resource-feature",
+		Role:      "feature",
+		Executor:  "docker",
+		Config: map[string]any{
+			"worker_resources": map[string]any{
+				"cpus":             "0.75",
+				"memory":           "768m",
+				"pids_limit":       96,
+				"read_only_rootfs": true,
+				"tmpfs_size":       "96m",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	manager := NewManager(config.Config{
+		WorkerCPUs:            "2",
+		WorkerMemory:          "4g",
+		WorkerPidsLimit:       512,
+		WorkerReadOnlyRootFS:  true,
+		WorkerTmpfsSize:       "512m",
+		WorkerNoNewPrivileges: true,
+		WorkerCapDrop:         []string{"ALL"},
+	}, st)
+	policy := manager.workerResourcePolicy(domain.Task{
+		ProjectID: "proj_demo",
+		Envelope:  domain.TaskEnvelope{AgentProfile: "resource-feature"},
+	})
+	if policy.CPUs != "0.75" || policy.Memory != "768m" || policy.PidsLimit != 96 || policy.TmpfsSize != "96m" {
+		t.Fatalf("resource policy = %#v", policy)
+	}
+}
+
+func TestWorkerCommandPolicyBlocksDeniedCommands(t *testing.T) {
+	st := store.NewMemoryStore()
+	task := st.CreateTask(domain.TaskEnvelope{
+		TaskID:          "CMD-POLICY-1",
+		ProjectID:       "proj_demo",
+		RepositoryID:    "repo_demo",
+		Title:           "Command policy test",
+		BaseBranch:      "origin/main",
+		TargetBranch:    "codex/cmd-policy-1",
+		Role:            "feature",
+		Skill:           "company-feature-worker",
+		AgentProfile:    "feature-worker-go-node",
+		Executor:        "docker",
+		AllowedPaths:    []string{"internal/**"},
+		ForbiddenPaths:  []string{".env*"},
+		AllowedCommands: []string{"go test ./...", "git push origin main"},
+	})
+	run, err := st.StartRun(task.ID, "feature", "docker")
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	manager := NewManager(config.Config{WorkerCommandDenylist: []string{"git push"}}, st)
+	if !manager.enforceWorkerPlanPolicy(task, run) {
+		t.Fatalf("expected worker command policy to block")
+	}
+	updated, err := st.GetRun(run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if updated.Status != "blocked" {
+		t.Fatalf("run status = %q", updated.Status)
+	}
+	foundAudit := false
+	for _, entry := range st.ListAuditLogs() {
+		if entry.Action == "worker.command_policy" && entry.ResourceID == run.ID {
+			foundAudit = true
+			break
+		}
+	}
+	if !foundAudit {
+		t.Fatalf("expected command policy audit log")
 	}
 }
 
@@ -339,12 +463,103 @@ func TestWorkerSecretEnvPlanCanResolveFromVaultProvider(t *testing.T) {
 	}
 }
 
+func TestCollectArtifactsRecordsDependencyPolicyBlock(t *testing.T) {
+	workspace := t.TempDir()
+	for _, command := range [][]string{
+		{"init"},
+		{"config", "user.email", "multi-codex@example.invalid"},
+		{"config", "user.name", "multi-codex test"},
+	} {
+		runGit(t, workspace, command...)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "README.md"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module example.com/demo\n\ngo 1.25\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, workspace, "add", ".")
+	runGit(t, workspace, "commit", "-m", "initial")
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module example.com/demo\n\ngo 1.25\n\nrequire example.com/pkg v1.2.3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	st := store.NewMemoryStore()
+	task := st.CreateTask(domain.TaskEnvelope{
+		TaskID:          "DEP-POLICY-1",
+		ProjectID:       "proj_demo",
+		RepositoryID:    "repo_demo",
+		Title:           "Dependency policy test",
+		BaseBranch:      "origin/main",
+		TargetBranch:    "codex/dep-policy-1",
+		Role:            "feature",
+		Skill:           "company-feature-worker",
+		AgentProfile:    "feature-worker-go-node",
+		Executor:        "docker",
+		AllowedPaths:    []string{"**"},
+		ForbiddenPaths:  []string{".env*"},
+		AllowedCommands: []string{"go test ./..."},
+		Policy:          domain.TaskPolicy{AllowDependencyChange: false},
+	})
+	run, err := st.StartRun(task.ID, "feature", "docker")
+	if err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	runDir := t.TempDir()
+	for name, content := range map[string]string{
+		"worker.log":  "done\n",
+		"result.json": "{}\n",
+		"diff.patch":  "",
+	} {
+		if err := os.WriteFile(filepath.Join(runDir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager := NewManager(config.Config{}, st)
+	if err := manager.collectArtifactsAndScope(context.Background(), task, run, runContext{RunDir: runDir, Workspace: workspace}); err != nil {
+		t.Fatalf("collect artifacts: %v", err)
+	}
+	updatedTask, err := st.GetTask(task.ID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if updatedTask.Status != "blocked" {
+		t.Fatalf("task status = %q", updatedTask.Status)
+	}
+	foundEvent := false
+	foundAudit := false
+	for _, event := range st.ListEvents(run.ID) {
+		if event.EventType == "dependency_policy" && event.Payload["status"] == "blocked" {
+			foundEvent = true
+		}
+	}
+	for _, entry := range st.ListAuditLogs() {
+		if entry.Action == "worker.dependency_policy" && entry.ResourceID == run.ID {
+			foundAudit = true
+			break
+		}
+	}
+	if !foundEvent || !foundAudit {
+		t.Fatalf("expected dependency policy event=%v audit=%v", foundEvent, foundAudit)
+	}
+}
+
 func TestRedactWithSecretValues(t *testing.T) {
 	got := redactWithSecrets("token=sk-test-secret password=keep", []string{"sk-test-secret"})
 	if got == "token=sk-test-secret password=keep" {
 		t.Fatalf("expected redaction")
 	}
 	for _, leaked := range []string{"sk-test-secret", "token", "password"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("redacted output leaked %q: %s", leaked, got)
+		}
+	}
+}
+
+func TestRedactDetectsStructuredSecrets(t *testing.T) {
+	input := "github=ghp_abcdefghijklmnopqrstuvwxyz aws=AKIA1234567890ABCDEF jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature123456789 password=hunter2"
+	got := redact(input)
+	for _, leaked := range []string{"ghp_abcdefghijklmnopqrstuvwxyz", "AKIA1234567890ABCDEF", "eyJhbGciOiJIUzI1NiJ9", "hunter2", "password"} {
 		if strings.Contains(got, leaked) {
 			t.Fatalf("redacted output leaked %q: %s", leaked, got)
 		}
@@ -636,5 +851,14 @@ func TestRunSSHAgentDHTTPSendsBearerToken(t *testing.T) {
 	}
 	if !foundAudit {
 		t.Fatalf("expected ssh agentd audit log")
+	}
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s failed: %v: %s", strings.Join(args, " "), err, output)
 	}
 }

@@ -1,8 +1,11 @@
 package mcp
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/Chiiz0/multi-codex/internal/config"
@@ -25,11 +28,60 @@ func TestGitPublishPRToolAuditsCredentialMetadata(t *testing.T) {
 		t.Fatalf("run = %#v", run)
 	}
 
-	assertMCPGitPublishEvent(t, st, runID)
-	assertMCPGitPublishAudit(t, st, runID)
+	assertMCPGitPublishEvent(t, st, runID, false)
+	assertMCPGitPublishAudit(t, st, runID, false)
 }
 
-func assertMCPGitPublishEvent(t *testing.T, st store.Store, runID string) {
+func TestGitPublishPRToolLiveCreatesProviderPRWithoutAutoMerge(t *testing.T) {
+	st := store.NewMemoryStore()
+	task := mcpGitPublishReadyTask(t, st)
+	var gotAuthorization string
+	var gotPayload map[string]any
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/example/repo/pulls" {
+			t.Fatalf("provider path = %q", r.URL.Path)
+		}
+		gotAuthorization = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotPayload); err != nil {
+			t.Fatalf("decode provider payload: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"html_url":"https://github.com/example/repo/pull/43","number":43}`))
+	}))
+	defer provider.Close()
+	server := NewServer(config.Config{
+		GitSyncMode:  "live",
+		GitHubAPIURL: provider.URL,
+		GitHubToken:  "gh-live-token",
+	}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	resp := callMCPToolForTest(t, server, "git_publish_pr", map[string]any{"task_id": task.ID})
+	result := resp["result"].(map[string]any)
+	structured := result["structuredContent"].(map[string]any)
+	run := structured["run"].(map[string]any)
+	runID, _ := run["id"].(string)
+	publishResult := structured["result"].(map[string]any)
+	if runID == "" || run["status"] != "succeeded" || publishResult["status"] != "published" {
+		t.Fatalf("publish structured content = %#v", structured)
+	}
+	if publishResult["dry_run"] != false || publishResult["auto_merge"] != false {
+		t.Fatalf("publish safety flags = %#v", publishResult)
+	}
+	if publishResult["pr_url"] != "https://github.com/example/repo/pull/43" {
+		t.Fatalf("pr url = %#v", publishResult["pr_url"])
+	}
+	if gotAuthorization != "token gh-live-token" {
+		t.Fatalf("authorization = %q", gotAuthorization)
+	}
+	if gotPayload["head"] != "codex/publish-pr-metadata" || gotPayload["base"] != "main" {
+		t.Fatalf("provider payload = %#v", gotPayload)
+	}
+
+	assertMCPGitPublishEvent(t, st, runID, true)
+	assertMCPGitPublishAudit(t, st, runID, true)
+}
+
+func assertMCPGitPublishEvent(t *testing.T, st store.Store, runID string, wantCredentialResolved bool) {
 	t.Helper()
 	for _, event := range st.ListEvents(runID) {
 		if event.EventType != "git_publish_pr" {
@@ -38,7 +90,7 @@ func assertMCPGitPublishEvent(t *testing.T, st store.Store, runID string) {
 		if event.Payload["credential_provider"] != "env" {
 			t.Fatalf("credential provider event payload = %#v", event.Payload)
 		}
-		if resolved, ok := event.Payload["credential_resolved"].(bool); !ok || resolved {
+		if resolved, ok := event.Payload["credential_resolved"].(bool); !ok || resolved != wantCredentialResolved {
 			t.Fatalf("credential resolved event payload = %#v", event.Payload)
 		}
 		if event.Payload["auto_merge"] != false {
@@ -49,7 +101,7 @@ func assertMCPGitPublishEvent(t *testing.T, st store.Store, runID string) {
 	t.Fatalf("expected git_publish_pr run event")
 }
 
-func assertMCPGitPublishAudit(t *testing.T, st store.Store, runID string) {
+func assertMCPGitPublishAudit(t *testing.T, st store.Store, runID string, wantCredentialResolved bool) {
 	t.Helper()
 	for _, entry := range st.ListAuditLogs() {
 		if entry.Action != "mcp.git_publish_pr" || entry.ResourceID != runID {
@@ -58,7 +110,7 @@ func assertMCPGitPublishAudit(t *testing.T, st store.Store, runID string) {
 		if entry.Payload["credential_provider"] != "env" {
 			t.Fatalf("credential provider audit payload = %#v", entry.Payload)
 		}
-		if resolved, ok := entry.Payload["credential_resolved"].(bool); !ok || resolved {
+		if resolved, ok := entry.Payload["credential_resolved"].(bool); !ok || resolved != wantCredentialResolved {
 			t.Fatalf("credential resolved audit payload = %#v", entry.Payload)
 		}
 		if entry.Payload["auto_merge"] != false {

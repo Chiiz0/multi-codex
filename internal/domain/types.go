@@ -9,6 +9,7 @@ import (
 
 type Project struct {
 	ID          string    `json:"id"`
+	OrgID       string    `json:"org_id,omitempty"`
 	Name        string    `json:"name"`
 	Slug        string    `json:"slug"`
 	Description string    `json:"description"`
@@ -55,6 +56,7 @@ type AuthContext struct {
 
 type Skill struct {
 	ID            string    `json:"id"`
+	OrgID         string    `json:"org_id,omitempty"`
 	Name          string    `json:"name"`
 	Description   string    `json:"description"`
 	Role          string    `json:"role"`
@@ -91,6 +93,7 @@ type AgentProfile struct {
 
 type ExecutorNode struct {
 	ID                         string         `json:"id"`
+	OrgID                      string         `json:"org_id,omitempty"`
 	Kind                       string         `json:"kind"`
 	Name                       string         `json:"name"`
 	Address                    string         `json:"address,omitempty"`
@@ -323,6 +326,7 @@ type AuthLoginStateRetentionResult struct {
 
 type AuditLog struct {
 	ID           string         `json:"id"`
+	OrgID        string         `json:"org_id,omitempty"`
 	ActorType    string         `json:"actor_type"`
 	ActorID      string         `json:"actor_id"`
 	Action       string         `json:"action"`

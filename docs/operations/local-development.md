@@ -197,12 +197,14 @@ Git Sync dry-run mode needs no provider token:
 
 ```bash
 MULTICODEX_GIT_SYNC_MODE=dry-run
+MULTICODEX_GIT_SYNC_LIVE_REVIEWED=false
 ```
 
 Live provider calls are opt-in and still require the `pr_publish` approval gate. For local compatibility, set provider tokens on the API/MCP process:
 
 ```bash
 MULTICODEX_GIT_SYNC_MODE=live
+MULTICODEX_GIT_SYNC_LIVE_REVIEWED=true
 GITHUB_TOKEN=ghp_...
 GITLAB_TOKEN=glpat-...
 ```
@@ -301,6 +303,7 @@ go run ./cmd/mcxctl retention-cleanup -dry-run=true -max-age=720h
 go run ./cmd/mcxctl backup -output .data/backups/manual
 go run ./cmd/mcxctl audit-seal -output .data/audit-seals/manual
 go run ./cmd/mcxctl audit-ship -input .data/audit-seals/manual -target file://.data/audit-ship
+go run ./cmd/mcxctl pilot-verify -task-id <pilot-task-id> -strict=false
 ```
 
 `retention-cleanup` returns the original filesystem cleanup fields, an `mcp_sessions` section with dry-run/delete counts for expired persisted MCP replay sessions and events, an `auth_token_revocations` section with counts for expired logout denylist rows, an `auth_sessions` section with counts for expired or revoked browser session rows, and an `auth_login_states` section with counts for expired or consumed authorization-code login state rows.

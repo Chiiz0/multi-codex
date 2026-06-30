@@ -17,6 +17,10 @@ import (
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg := config.FromEnv()
+	if err := config.ValidateProduction(cfg, "api"); err != nil {
+		log.Error("production configuration rejected", "error", err)
+		os.Exit(1)
+	}
 	runtimeStore, err := store.Open(context.Background(), cfg.DatabaseURL, log)
 	if err != nil {
 		log.Error("open store failed", "error", err)

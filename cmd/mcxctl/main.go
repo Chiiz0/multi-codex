@@ -46,6 +46,8 @@ func main() {
 		auditSeal(log, os.Args[2:])
 	case "audit-ship":
 		auditShip(log, os.Args[2:])
+	case "pilot-verify":
+		pilotVerify(log, os.Args[2:])
 	default:
 		usage()
 		os.Exit(2)
@@ -332,6 +334,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  mcxctl audit-verify [-database-url URL] [-allow-legacy-hash-mismatch=false]")
 	fmt.Fprintln(os.Stderr, "  mcxctl audit-seal [-database-url URL] [-output DIR] [-allow-legacy-hash-mismatch=false]")
 	fmt.Fprintln(os.Stderr, "  mcxctl audit-ship -input DIR [-target DIR|file://DIR]")
+	fmt.Fprintln(os.Stderr, "  mcxctl pilot-verify -task-id ID [-strict=true] [-audit-ship-receipt PATH] [-backup-manifest PATH] [-restore-evidence PATH] [-signoff PATH]")
 }
 
 func archiveIfExists(root string, output string) error {

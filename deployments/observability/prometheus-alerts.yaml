@@ -1,0 +1,119 @@
+groups:
+  - name: multi-codex-availability
+    rules:
+      - alert: MultiCodexAPIHighErrorRate
+        expr: |
+          sum(rate(multi_codex_http_request_errors_total{service="multi-codex-api"}[5m]))
+          /
+          clamp_min(sum(rate(multi_codex_http_requests_total{service="multi-codex-api"}[5m])), 1) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: multi-codex API error rate is above 5%
+          runbook_url: docs/operations/runbooks/database-outage.md
+
+      - alert: MultiCodexMCPHighErrorRate
+        expr: |
+          sum(rate(multi_codex_http_request_errors_total{service="multi-codex-mcp-gateway"}[5m]))
+          /
+          clamp_min(sum(rate(multi_codex_http_requests_total{service="multi-codex-mcp-gateway"}[5m])), 1) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: multi-codex MCP Gateway error rate is above 5%
+          runbook_url: docs/operations/runbooks/database-outage.md
+
+      - alert: MultiCodexHighLatency
+        expr: |
+          histogram_quantile(0.95, sum by (le, service) (rate(multi_codex_http_request_duration_seconds_bucket[5m]))) > 2
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: multi-codex p95 HTTP latency is above 2 seconds
+          runbook_url: docs/operations/runbooks/database-outage.md
+
+  - name: multi-codex-workers
+    rules:
+      - alert: MultiCodexQueueDepthHigh
+        expr: sum(multi_codex_queue_depth) > 10
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: multi-codex worker queue depth is high
+          runbook_url: docs/operations/runbooks/stuck-queue.md
+
+      - alert: MultiCodexWorkerFailures
+        expr: sum(multi_codex_worker_terminal_failures{status=~"failed|timed_out|blocked"}) > 5
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: multi-codex has elevated terminal worker failures
+          runbook_url: docs/operations/runbooks/runaway-worker.md
+
+  - name: multi-codex-operations
+    rules:
+      - alert: MultiCodexAuditShipFailed
+        expr: increase(multi_codex_audit_action_total{action="api.audit_ship_failed"}[30m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: multi-codex audit seal or ship failed
+          runbook_url: docs/operations/runbooks/failed-audit-ship.md
+
+      - alert: MultiCodexAuditShipStale
+        expr: time() - max(multi_codex_audit_action_last_seen_timestamp_seconds{action="api.audit_ship"}) > 93600
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: multi-codex has not shipped audit logs for more than 26 hours
+          runbook_url: docs/operations/runbooks/failed-audit-ship.md
+
+      - alert: MultiCodexRetentionFailed
+        expr: increase(multi_codex_audit_action_total{action="api.retention_cleanup_failed"}[30m]) > 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: multi-codex retention cleanup failed
+          runbook_url: docs/operations/observability-and-dr.md
+
+      - alert: MultiCodexTelemetryPushFailed
+        expr: increase(multi_codex_audit_action_total{action=~"api.telemetry_push_failed|mcp.telemetry_push_failed"}[30m]) > 0
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: multi-codex telemetry push failed
+          runbook_url: docs/operations/observability-and-dr.md
+
+  - name: multi-codex-external-dependencies
+    rules:
+      - alert: MultiCodexPostgresUnavailable
+        expr: pg_up == 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: PostgreSQL exporter reports the database unavailable
+          runbook_url: docs/operations/runbooks/database-outage.md
+
+      - alert: MultiCodexDiskSpaceLow
+        expr: |
+          (
+            node_filesystem_avail_bytes{mountpoint=~"/var/lib/multi-codex|/var/lib/postgresql"}
+            /
+            node_filesystem_size_bytes{mountpoint=~"/var/lib/multi-codex|/var/lib/postgresql"}
+          ) < 0.15
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: multi-codex or PostgreSQL disk free space is below 15%
+          runbook_url: docs/operations/observability-and-dr.md

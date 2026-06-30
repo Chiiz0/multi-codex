@@ -1,0 +1,166 @@
+name: multi-codex-ci
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  DEV_IMAGE_TAG: multi-codex/dev:go1.25-node25.9-pnpm11.7
+  WORKER_IMAGE_TAG: multi-codex/codex-worker:go1.25-node-vite8
+  CODEX_CLI_VERSION: "0.142.2"
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build fixed dev image
+        run: docker build -f deployments/docker/Dockerfile.dev -t "${DEV_IMAGE_TAG}" .
+
+      - name: Backend tests
+        run: docker compose -f deployments/docker/compose.dev.yaml run --rm dev go test ./...
+
+      - name: Backend build
+        run: docker compose -f deployments/docker/compose.dev.yaml run --rm dev go build ./cmd/api ./cmd/mcp-gateway ./cmd/worker-agentd ./cmd/mcxctl
+
+      - name: Frontend build
+        run: docker compose -f deployments/docker/compose.dev.yaml run --rm dev bash -c 'pnpm --dir apps/web install --frozen-lockfile && pnpm --dir apps/web build'
+
+      - name: Compose config
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+        run: |
+          docker compose -f deployments/docker/compose.dev.yaml config >/dev/null
+          docker compose -f deployments/docker/compose.yaml config >/dev/null
+
+      - name: Migration check
+        run: |
+          docker compose -f deployments/docker/compose.dev.yaml up -d --wait postgres
+          docker compose -f deployments/docker/compose.dev.yaml run --rm dev go run ./cmd/mcxctl migrate
+
+      - name: Build release candidate images
+        run: |
+          docker build -f deployments/docker/Dockerfile.api -t multi-codex/api:ci-${GITHUB_SHA} .
+          docker build -f deployments/docker/Dockerfile.web -t multi-codex/web:ci-${GITHUB_SHA} .
+          docker build -f deployments/docker/Dockerfile.worker --build-arg CODEX_CLI_VERSION="${CODEX_CLI_VERSION}" -t multi-codex/codex-worker:ci-${GITHUB_SHA} .
+
+      - name: Generate SBOMs
+        uses: anchore/sbom-action@v0
+        with:
+          image: multi-codex/api:ci-${{ github.sha }}
+          output-file: sbom-api.spdx.json
+          format: spdx-json
+
+      - name: Generate web SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: multi-codex/web:ci-${{ github.sha }}
+          output-file: sbom-web.spdx.json
+          format: spdx-json
+
+      - name: Generate worker SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: multi-codex/codex-worker:ci-${{ github.sha }}
+          output-file: sbom-worker.spdx.json
+          format: spdx-json
+
+      - name: Scan API image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: multi-codex/api:ci-${{ github.sha }}
+          format: sarif
+          output: trivy-api.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Scan web image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: multi-codex/web:ci-${{ github.sha }}
+          format: sarif
+          output: trivy-web.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Scan worker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: multi-codex/codex-worker:ci-${{ github.sha }}
+          format: sarif
+          output: trivy-worker.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+
+      - name: Upload release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-${{ github.sha }}
+          path: |
+            sbom-*.spdx.json
+            trivy-*.sarif
+
+      - name: Compose down
+        if: always()
+        run: docker compose -f deployments/docker/compose.dev.yaml down -v
+
+  release-images:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployments/docker/Dockerfile.api
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/api:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}/api:sha-${{ github.sha }}
+
+      - name: Publish Web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployments/docker/Dockerfile.web
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/web:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}/web:sha-${{ github.sha }}
+
+      - name: Publish Worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deployments/docker/Dockerfile.worker
+          build-args: CODEX_CLI_VERSION=${{ env.CODEX_CLI_VERSION }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/codex-worker:${{ github.ref_name }}
+            ghcr.io/${{ github.repository }}/codex-worker:sha-${{ github.sha }}

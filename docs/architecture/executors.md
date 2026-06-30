@@ -58,7 +58,28 @@ The provided image pins `@openai/codex@0.142.2` and verifies `codex --version` d
 make worker-image
 ```
 
+Docker worker containers are started with deployment-controlled limits:
+
+```bash
+MULTICODEX_WORKER_CPUS=1
+MULTICODEX_WORKER_MEMORY=2g
+MULTICODEX_WORKER_PIDS_LIMIT=256
+MULTICODEX_WORKER_READ_ONLY_ROOTFS=true
+MULTICODEX_WORKER_TMPFS_SIZE=256m
+MULTICODEX_WORKER_NO_NEW_PRIVILEGES=true
+MULTICODEX_WORKER_CAP_DROP=ALL
+```
+
+The executor passes these to Docker as CPU, memory, pids, read-only root
+filesystem, tmpfs, no-new-privileges, and cap-drop settings. Agent Profile
+`config.worker_resources` can set task-specific values such as `cpus`,
+`memory`, `pids_limit`, `read_only_rootfs`, and `tmpfs_size`; the applied policy
+is recorded in `worker_resource_policy` run events and
+`worker.resource_policy` audit rows.
+
 Worker containers run with `--network none` by default. A task can request network only through `TaskEnvelope.network=true`, and policy accepts that request only when the selected Agent Profile has `network_enabled=true`.
+The applied network decision is recorded in `worker_network_policy` run events
+and `worker.network_policy` audit rows.
 
 Codex runtime credentials are also explicit. An Agent Profile can request environment variable names in `config.worker_secret_env`, but the Docker executor injects them only when:
 
@@ -87,7 +108,22 @@ MULTICODEX_WORKER_VAULT_MOUNT=kv
 MULTICODEX_WORKER_VAULT_SECRET_PATH=multi-codex/worker
 ```
 
-The executor passes only env names to Docker, records `worker_secret_env` run events, emits `worker.secret_env_decision` audit rows with provider/name/reason metadata, and redacts configured secret values from `worker.log`, `result.json`, `diff.patch`, and Docker output events. It does not store secret values in PostgreSQL.
+The executor passes only env names to Docker, records `worker_secret_env` run events, emits `worker.secret_env_decision` audit rows with provider/name/reason metadata, and redacts configured secret values from `worker.log`, `result.json`, `diff.patch`, and Docker output events. Redaction also detects common structured secrets such as OpenAI keys, GitHub/GitLab tokens, AWS access keys, Slack tokens, JWT-like tokens, private keys, and keyword assignment patterns. It does not store secret values in PostgreSQL.
+
+Production Compose does not mount `/var/run/docker.sock` by default. If a first
+deployment intentionally runs Docker workers from the control-plane container,
+it must be on a dedicated isolated worker host and must set both:
+
+```bash
+MULTICODEX_EXECUTOR_MODE=docker
+MULTICODEX_WORKER_DOCKER_SOCKET_ENABLED=true
+MULTICODEX_WORKER_DOCKER_SOCKET_BOUNDARY=isolated-worker-host
+```
+
+Production startup rejects `MULTICODEX_EXECUTOR_MODE=docker` unless that
+boundary is explicit. The safer default production path is to keep the API and
+MCP Gateway off the host Docker socket and register isolated executor nodes for
+worker capacity.
 
 ## Node Assignment
 

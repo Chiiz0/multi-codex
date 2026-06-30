@@ -434,7 +434,7 @@ func (s *PostgresStore) ListSkills() []domain.Skill {
 	defer cancel()
 
 	rows, err := s.db.QueryContext(ctx, `
-SELECT s.id::text, s.name, s.description, s.role::text, s.enabled,
+SELECT s.id::text, s.org_id::text, s.name, s.description, s.role::text, s.enabled,
        COALESCE(v.version, '') AS version,
        COALESCE(v.content_hash, '') AS content_hash,
        COALESCE(v.path, '') AS path,
@@ -457,7 +457,7 @@ ORDER BY s.name ASC`)
 	skills := []domain.Skill{}
 	for rows.Next() {
 		var skill domain.Skill
-		if err := rows.Scan(&skill.ID, &skill.Name, &skill.Description, &skill.Role, &skill.Enabled, &skill.LatestVersion, &skill.ContentHash, &skill.Path, &skill.CreatedAt); err != nil {
+		if err := rows.Scan(&skill.ID, &skill.OrgID, &skill.Name, &skill.Description, &skill.Role, &skill.Enabled, &skill.LatestVersion, &skill.ContentHash, &skill.Path, &skill.CreatedAt); err != nil {
 			s.log.Error("scan skill failed", "error", err)
 			return skills
 		}
@@ -512,6 +512,9 @@ func (s *PostgresStore) CreateSkill(skill domain.Skill, version domain.SkillVers
 	if version.ContentHash == "" {
 		version.ContentHash = deterministicHash(skill.Name + ":" + version.Path + ":" + version.Version)
 	}
+	if skill.OrgID == "" {
+		skill.OrgID = defaultOrgID
+	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -526,9 +529,9 @@ ON CONFLICT (org_id, name) DO UPDATE
 SET description = EXCLUDED.description,
     role = EXCLUDED.role,
     enabled = EXCLUDED.enabled
-RETURNING id::text, name, description, role::text, enabled, created_at`,
-		defaultOrgID, skill.Name, skill.Description, dbRole(skill.Role), skill.Enabled,
-	).Scan(&skill.ID, &skill.Name, &skill.Description, &skill.Role, &skill.Enabled, &skill.CreatedAt); err != nil {
+RETURNING id::text, org_id::text, name, description, role::text, enabled, created_at`,
+		skill.OrgID, skill.Name, skill.Description, dbRole(skill.Role), skill.Enabled,
+	).Scan(&skill.ID, &skill.OrgID, &skill.Name, &skill.Description, &skill.Role, &skill.Enabled, &skill.CreatedAt); err != nil {
 		return domain.Skill{}, err
 	}
 
@@ -619,7 +622,7 @@ func (s *PostgresStore) ListExecutorNodes() []domain.ExecutorNode {
 	defer cancel()
 
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id::text, kind::text, name, COALESCE(address, ''), COALESCE(agentd_url, ''),
+SELECT id::text, org_id::text, kind::text, name, COALESCE(address, ''), COALESCE(agentd_url, ''),
        COALESCE(host_key_fingerprint, ''), COALESCE(observed_host_key_fingerprint, ''),
        host_key_verified, COALESCE(forced_command, ''), labels, capacity, status,
        last_seen_at, verified_at, created_at
@@ -648,7 +651,7 @@ func (s *PostgresStore) GetExecutorNode(id string) (domain.ExecutorNode, error) 
 	defer cancel()
 
 	node, err := scanExecutorNode(s.db.QueryRowContext(ctx, `
-SELECT id::text, kind::text, name, COALESCE(address, ''), COALESCE(agentd_url, ''),
+SELECT id::text, org_id::text, kind::text, name, COALESCE(address, ''), COALESCE(agentd_url, ''),
        COALESCE(host_key_fingerprint, ''), COALESCE(observed_host_key_fingerprint, ''),
        host_key_verified, COALESCE(forced_command, ''), labels, capacity, status,
        last_seen_at, verified_at, created_at
@@ -673,6 +676,9 @@ func (s *PostgresStore) RegisterExecutorNode(node domain.ExecutorNode) (domain.E
 	if node.Status == "" {
 		node.Status = "active"
 	}
+	if node.OrgID == "" {
+		node.OrgID = defaultOrgID
+	}
 	labelsBytes, _ := json.Marshal(node.Labels)
 	capacityBytes, _ := json.Marshal(node.Capacity)
 	row := s.db.QueryRowContext(ctx, `
@@ -691,11 +697,11 @@ SET kind = EXCLUDED.kind,
     status = EXCLUDED.status,
     last_seen_at = now(),
     verified_at = EXCLUDED.verified_at
-RETURNING id::text, kind::text, name, COALESCE(address, ''), COALESCE(agentd_url, ''),
+RETURNING id::text, org_id::text, kind::text, name, COALESCE(address, ''), COALESCE(agentd_url, ''),
           COALESCE(host_key_fingerprint, ''), COALESCE(observed_host_key_fingerprint, ''),
           host_key_verified, COALESCE(forced_command, ''), labels, capacity, status,
           last_seen_at, verified_at, created_at`,
-		defaultOrgID, node.Kind, node.Name, node.Address, node.AgentDURL, node.HostKeyFingerprint, node.ObservedHostKeyFingerprint, node.HostKeyVerified, node.ForcedCommand, labelsBytes, capacityBytes, node.Status,
+		node.OrgID, node.Kind, node.Name, node.Address, node.AgentDURL, node.HostKeyFingerprint, node.ObservedHostKeyFingerprint, node.HostKeyVerified, node.ForcedCommand, labelsBytes, capacityBytes, node.Status,
 	)
 	node, err := scanExecutorNode(row)
 	if err != nil {
@@ -717,7 +723,7 @@ SET observed_host_key_fingerprint = $2,
     verified_at = CASE WHEN (CASE WHEN COALESCE(host_key_fingerprint, '') = '' THEN true ELSE host_key_fingerprint = $2 END) THEN now() ELSE verified_at END,
     last_seen_at = now()
 WHERE id = $1
-RETURNING id::text, kind::text, name, COALESCE(address, ''), COALESCE(agentd_url, ''),
+RETURNING id::text, org_id::text, kind::text, name, COALESCE(address, ''), COALESCE(agentd_url, ''),
           COALESCE(host_key_fingerprint, ''), COALESCE(observed_host_key_fingerprint, ''),
           host_key_verified, COALESCE(forced_command, ''), labels, capacity, status,
           last_seen_at, verified_at, created_at`, id, observedFingerprint))
@@ -968,6 +974,7 @@ func scanExecutorNode(row rowScanner) (domain.ExecutorNode, error) {
 	var verifiedAt sql.NullTime
 	err := row.Scan(
 		&node.ID,
+		&node.OrgID,
 		&node.Kind,
 		&node.Name,
 		&node.Address,

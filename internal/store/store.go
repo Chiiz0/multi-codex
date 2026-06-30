@@ -23,11 +23,19 @@ type Store interface {
 	CreateAuthLoginState(state domain.AuthLoginState) (domain.AuthLoginState, error)
 	ConsumeAuthLoginState(stateHash string, now time.Time) (domain.AuthLoginState, error)
 	CleanupAuthLoginStates(cutoff time.Time, dryRun bool) (domain.AuthLoginStateRetentionResult, error)
+	GetUserByEmail(email string) (domain.AuthContext, string, error)
+	SetUserPassword(userID string, passwordHash string) error
+	ListUsers(orgID string) []domain.User
+	ListMemberships(orgID string) []domain.Membership
+	UpsertUser(user domain.User, orgID string, role string) (domain.AuthContext, error)
 	ListOrganizations() []domain.Organization
 	CreateOrganization(org domain.Organization) (domain.Organization, error)
 	ListProjects() []domain.Project
 	CreateProject(project domain.Project) domain.Project
 	GetProject(id string) (domain.Project, error)
+	ListProjectMemberships(projectID string) []domain.ProjectMembership
+	ListProjectMembershipsForUser(userID string) []domain.ProjectMembership
+	UpsertProjectMembership(membership domain.ProjectMembership) (domain.ProjectMembership, error)
 	ListRepositories(projectID string) []domain.Repository
 	CreateRepository(repo domain.Repository) domain.Repository
 	GetRepository(id string) (domain.Repository, error)

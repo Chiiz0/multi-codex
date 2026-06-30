@@ -12,6 +12,7 @@ import {
   createProject,
   createRepository,
   createSkill,
+  createUser,
   createTask,
   decideApproval,
   dispatchQueue,
@@ -28,6 +29,7 @@ import {
   listAuditLogs,
   listExecutorNodes,
   listOrganizations,
+  listProjectMembers,
   listProjects,
   listRepositories,
   listRunEvents,
@@ -36,6 +38,8 @@ import {
   listSkills,
   listTasks,
   listToolCalls,
+  listUsers,
+  loginWithPassword,
   logout,
   parseRunEventPayload,
   registerExecutorNode,
@@ -45,6 +49,7 @@ import {
   scopeCheck,
   startTask,
   setAuthToken,
+  upsertProjectMember,
   verifyExecutorNodeHostKey
 } from "../../lib/api";
 import type {
@@ -55,19 +60,36 @@ import type {
   AuthContext,
   Organization,
   Project,
+  ProjectMembership,
   QueueSnapshot,
   Repository,
   Run,
   RunEvent,
   SkillVersion,
   Task,
-  ToolCall
+  ToolCall,
+  UserDirectory
 } from "../../lib/api";
 import { LanguageToggle, useI18n } from "../../lib/i18n";
-import { AccessProvider, hasPermission, useAccess, visiblePermissions } from "../../lib/permissions";
+import { AccessProvider, hasPermission, projectRole, useAccess, visiblePermissions } from "../../lib/permissions";
 import type { Permission } from "../../lib/permissions";
 
-type View = "dashboard" | "tasks" | "runs" | "queue" | "approvals" | "nodes" | "organizations" | "skills" | "audit";
+type View = "dashboard" | "tasks" | "runs" | "queue" | "approvals" | "nodes" | "organizations" | "skills" | "admin" | "audit";
+type ListLimit = 10 | 20 | 50;
+type ListPager = {
+  hasNext: boolean;
+  hasPrevious: boolean;
+  limit: ListLimit;
+  page: number;
+  pageCount: number;
+  setLimit: (value: ListLimit) => void;
+  goNext: () => void;
+  goPrevious: () => void;
+  total: number;
+};
+type ListPagination<T> = ListPager & { items: T[] };
+
+const listLimitOptions = [10, 20, 50] as const;
 
 const navItems: Array<{ id: View; labelKey: string; permission: Permission }> = [
   { id: "dashboard", labelKey: "nav.dashboard", permission: "projects:read" },
@@ -78,30 +100,135 @@ const navItems: Array<{ id: View; labelKey: string; permission: Permission }> = 
   { id: "nodes", labelKey: "nav.nodes", permission: "nodes:read" },
   { id: "organizations", labelKey: "nav.organizations", permission: "organizations:read" },
   { id: "skills", labelKey: "nav.skills", permission: "projects:read" },
+  { id: "admin", labelKey: "nav.admin", permission: "users:read" },
   { id: "audit", labelKey: "nav.audit", permission: "audit:read" }
 ];
+
+function ListLimitControl({
+  label,
+  onChange,
+  value
+}: {
+  label?: string;
+  onChange: (value: ListLimit) => void;
+  value: ListLimit;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="list-limit-control" role="group" aria-label={label ?? t("common.displayCount")}>
+      <span>{t("common.show")}</span>
+      {listLimitOptions.map((option) => (
+        <button
+          aria-label={t("common.rows", { count: option })}
+          aria-pressed={value === option}
+          className={value === option ? "active" : ""}
+          key={option}
+          onClick={() => onChange(option)}
+          type="button"
+        >
+          {option}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function ListPaginationControl({ label, pagination }: { label?: string; pagination: ListPager }) {
+  const { t } = useI18n();
+  return (
+    <div className="list-pagination-control" role="group" aria-label={label ?? t("common.pagination")}>
+      <ListLimitControl label={label} value={pagination.limit} onChange={pagination.setLimit} />
+      <div className="pager-control">
+        <button
+          aria-label={t("common.previousPage")}
+          disabled={!pagination.hasPrevious}
+          onClick={pagination.goPrevious}
+          type="button"
+        >
+          {t("common.prev")}
+        </button>
+        <span>{t("common.pageStatus", { page: pagination.page, pages: pagination.pageCount })}</span>
+        <button aria-label={t("common.nextPage")} disabled={!pagination.hasNext} onClick={pagination.goNext} type="button">
+          {t("common.next")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function useListPagination<T>(items: T[], options: { fromEnd?: boolean } = {}): ListPagination<T> {
+  const [limit, setLimitState] = useState<ListLimit>(10);
+  const [page, setPage] = useState(1);
+  const total = items.length;
+  const pageCount = Math.max(1, Math.ceil(total / limit));
+  const normalizedPage = Math.min(page, pageCount);
+
+  useEffect(() => {
+    setPage((current) => Math.min(Math.max(current, 1), pageCount));
+  }, [pageCount]);
+
+  const visibleItems = useMemo(() => {
+    if (!total) {
+      return [];
+    }
+    if (options.fromEnd) {
+      const end = Math.max(total - (normalizedPage - 1) * limit, 0);
+      const start = Math.max(end - limit, 0);
+      return items.slice(start, end);
+    }
+    const start = (normalizedPage - 1) * limit;
+    return items.slice(start, start + limit);
+  }, [items, limit, normalizedPage, options.fromEnd, total]);
+
+  return {
+    hasNext: normalizedPage < pageCount,
+    hasPrevious: normalizedPage > 1,
+    items: visibleItems,
+    limit,
+    page: normalizedPage,
+    pageCount,
+    setLimit: (nextLimit: ListLimit) => {
+      setLimitState(nextLimit);
+      setPage(1);
+    },
+    goNext: () => setPage((current) => Math.min(current + 1, pageCount)),
+    goPrevious: () => setPage((current) => Math.max(current - 1, 1)),
+    total
+  };
+}
 
 export function TaskBoard() {
   const { t } = useI18n();
   const [view, setView] = useHashView();
+  const [path, setPath] = useState(() => window.location.pathname);
   const [selectedProjectId, setSelectedProjectId] = useState<string | undefined>();
   const [selectedRepositoryId, setSelectedRepositoryId] = useState<string | undefined>();
   const [selectedTaskId, setSelectedTaskId] = useState<string | undefined>();
   const [tokenDraft, setTokenDraft] = useState(getAuthToken);
+  const [loginEmail, setLoginEmail] = useState("local-dev@multi-codex.invalid");
+  const [loginPassword, setLoginPassword] = useState("admin123");
   const capabilities = useQuery({ queryKey: ["auth-capabilities"], queryFn: getAuthCapabilities, staleTime: 60_000 });
-  const auth = useQuery({ queryKey: ["auth"], queryFn: getAuthContext });
+  const auth = useQuery({ queryKey: ["auth"], queryFn: getAuthContext, retry: false });
   const isAuthenticated = Boolean(auth.data);
+  const isLoginRoute = path === "/login";
   const canProjectsRead = isAuthenticated && hasPermission(auth.data, "projects:read");
   const canOrganizationsRead = isAuthenticated && hasPermission(auth.data, "organizations:read");
   const canRunsRead = isAuthenticated && hasPermission(auth.data, "runs:read");
-  const canNodesRead = isAuthenticated && hasPermission(auth.data, "nodes:read");
+  const canUsersRead = isAuthenticated && hasPermission(auth.data, "users:read");
   const canAuditRead = isAuthenticated && hasPermission(auth.data, "audit:read");
+  const navigate = (nextPath: string) => {
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState(null, "", nextPath);
+    }
+    setPath(window.location.pathname);
+  };
   const logoutMutation = useMutation({
     mutationFn: logout,
     onSettled: () => {
       clearAuthToken();
       setTokenDraft("");
       queryClient.invalidateQueries();
+      navigate("/login");
     }
   });
   const connectMutation = useMutation({
@@ -111,10 +238,22 @@ export function TaskBoard() {
       setTokenDraft("");
       queryClient.setQueryData(["auth"], nextAuth);
       queryClient.invalidateQueries();
+      navigate("/");
+    }
+  });
+  const passwordLoginMutation = useMutation({
+    mutationFn: loginWithPassword,
+    onSuccess: (nextAuth) => {
+      clearAuthToken();
+      setTokenDraft("");
+      queryClient.setQueryData(["auth"], nextAuth);
+      queryClient.invalidateQueries();
+      navigate("/");
     }
   });
   const organizations = useQuery({ queryKey: ["organizations"], queryFn: listOrganizations, enabled: canOrganizationsRead });
   const projects = useQuery({ queryKey: ["projects"], queryFn: listProjects, enabled: canProjectsRead });
+  const users = useQuery({ queryKey: ["users"], queryFn: listUsers, enabled: canUsersRead });
   const activeProject = useMemo(() => {
     if (!projects.data?.length) {
       return undefined;
@@ -163,21 +302,75 @@ export function TaskBoard() {
     }
   }, [repositories.data, selectedRepositoryId]);
 
+  useEffect(() => {
+    const onPopState = () => setPath(window.location.pathname);
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    if (!auth.data && capabilities.data?.auth_mode !== "oidc" && capabilities.data?.local_admin_email) {
+      setLoginEmail((current) => (current === "local-dev@multi-codex.invalid" ? capabilities.data!.local_admin_email! : current));
+    }
+  }, [auth.data, capabilities.data]);
+
+  useEffect(() => {
+    if (auth.data && isLoginRoute) {
+      navigate("/");
+    }
+    if (auth.isError && !isLoginRoute) {
+      navigate("/login");
+    }
+  }, [auth.data, auth.isError, isLoginRoute]);
+
   const activeNavItem = navItems.find((item) => item.id === view) ?? navItems[0];
   const canViewActive = isAuthenticated && hasPermission(auth.data, activeNavItem.permission);
+  const activeProjectRole = projectRole(auth.data, activeProject?.id);
+  const saveToken = () => {
+    const trimmed = tokenDraft.trim();
+    if (trimmed) {
+      connectMutation.mutate(trimmed);
+    } else {
+      setAuthToken("");
+      queryClient.invalidateQueries();
+    }
+  };
 
   return (
     <AccessProvider auth={auth.data}>
+    {isLoginRoute ? (
+      <LoginPage
+        auth={auth.data}
+        authError={passwordLoginMutation.error instanceof Error ? passwordLoginMutation.error : null}
+        capabilities={capabilities.data}
+        isConnecting={connectMutation.isPending}
+        isPasswordLoginPending={passwordLoginMutation.isPending}
+        loginEmail={loginEmail}
+        loginPassword={loginPassword}
+        onLoginEmailChange={setLoginEmail}
+        onLoginPasswordChange={setLoginPassword}
+        onOIDCLogin={beginOIDCLogin}
+        onPasswordLogin={() => passwordLoginMutation.mutate({ email: loginEmail, password: loginPassword })}
+        onOpenConsole={() => navigate("/")}
+        onSaveToken={saveToken}
+        tokenDraft={tokenDraft}
+        onTokenDraftChange={setTokenDraft}
+      />
+    ) : (
     <main className="shell">
       <aside className="sidebar">
         <div className="brand">
           <span className="brand-mark">mcx</span>
           <div>
             <h1>multi-codex</h1>
-            <p>{auth.data ? `${auth.data.user.display_name} · ${auth.data.membership.role}` : t("app.subtitle")}</p>
+            <p>
+              {auth.data
+                ? t("auth.sessionUserRole", { user: auth.data.user.display_name, role: roleLabel(auth.data.membership.role, t) })
+                : t("app.subtitle")}
+            </p>
           </div>
         </div>
-        <nav className="nav-list" aria-label="Primary">
+        <nav className="nav-list" aria-label={t("nav.primary")}>
           {navItems.map((item) => {
             const navAllowed = isAuthenticated && hasPermission(auth.data, item.permission);
             return (
@@ -203,15 +396,7 @@ export function TaskBoard() {
           isLoggingOut={logoutMutation.isPending}
           onOIDCLogin={beginOIDCLogin}
           onLogout={() => logoutMutation.mutate()}
-          onSaveToken={() => {
-            const trimmed = tokenDraft.trim();
-            if (trimmed) {
-              connectMutation.mutate(trimmed);
-            } else {
-              setAuthToken("");
-              queryClient.invalidateQueries();
-            }
-          }}
+          onSaveToken={saveToken}
           tokenDraft={tokenDraft}
           onTokenDraftChange={setTokenDraft}
         />
@@ -252,8 +437,8 @@ export function TaskBoard() {
               </select>
             </label>
             <div className="branch-pill">
-              <span>{t("topbar.branch")}</span>
-              <strong>{activeRepository?.default_branch ?? "main"}</strong>
+              <span>{activeProjectRole ? t("topbar.projectRole") : t("topbar.branch")}</span>
+              <strong>{activeProjectRole ? roleLabel(activeProjectRole, t) : activeRepository?.default_branch || "main"}</strong>
             </div>
           </div>
           <div className="system-strip">
@@ -265,34 +450,18 @@ export function TaskBoard() {
         </header>
 
         {auth.data ? (
-          <section className="summary-strip" aria-label="Workspace summary">
-            <Metric label={t("summary.repositories")} value={repositories.data?.length ?? 0} />
+          <section className="summary-strip" aria-label={t("summary.workspace")}>
+            <Metric label={t("summary.projects")} value={projects.data?.length ?? 0} />
             <Metric label={t("summary.tasks")} value={tasks.data?.length ?? 0} />
             <Metric label={t("summary.runs")} value={runs.data?.length ?? 0} />
             <Metric label={t("summary.queued")} value={queue.data?.queued_runs.length ?? 0} />
-            <Metric label={t("summary.approvals")} value={approvals.data?.filter((approval) => approval.status === "pending").length ?? 0} />
+            <Metric label={t("summary.users")} value={users.data?.users.length ?? 0} />
           </section>
         ) : null}
 
         <div className="view-host">
           {!auth.data ? (
-            <LoginPanel
-              capabilities={capabilities.data}
-              authError={auth.error}
-              isConnecting={connectMutation.isPending}
-              onOIDCLogin={beginOIDCLogin}
-              onSaveToken={() => {
-                const trimmed = tokenDraft.trim();
-                if (trimmed) {
-                  connectMutation.mutate(trimmed);
-                } else {
-                  setAuthToken("");
-                  queryClient.invalidateQueries();
-                }
-              }}
-              tokenDraft={tokenDraft}
-              onTokenDraftChange={setTokenDraft}
-            />
+            <AccessPanel permission="auth:session" />
           ) : !canViewActive ? (
             <AccessPanel permission={activeNavItem.permission} />
           ) : view === "dashboard" ? (
@@ -328,10 +497,19 @@ export function TaskBoard() {
           {auth.data && canViewActive && view === "nodes" ? <NodesView /> : null}
           {auth.data && canViewActive && view === "organizations" ? <OrganizationsView organizations={organizations.data ?? []} /> : null}
           {auth.data && canViewActive && view === "skills" ? <SkillsView projectId={activeProject?.id} /> : null}
+          {auth.data && canViewActive && view === "admin" ? (
+            <AdminView
+              activeProject={activeProject}
+              onSelectProject={setSelectedProjectId}
+              projects={projects.data ?? []}
+              users={users.data}
+            />
+          ) : null}
           {auth.data && canViewActive && view === "audit" ? <AuditView /> : null}
         </div>
       </section>
     </main>
+    )}
     </AccessProvider>
   );
 }
@@ -361,8 +539,13 @@ function AuthControls({
 }) {
   const { t } = useI18n();
   const permissions = visiblePermissions(auth);
-  const sessionLabel = auth ? `${auth.user.email} · ${auth.membership.role}` : authError ? t("auth.required") : t("auth.checking");
+  const sessionLabel = auth
+    ? t("auth.sessionUserRole", { user: auth.user.email, role: roleLabel(auth.membership.role, t) })
+    : authError
+      ? t("auth.required")
+      : t("auth.checking");
   const authMode = capabilities ? (capabilities.auth_mode === "oidc" ? t("auth.oidc") : t("auth.local")) : t("auth.checking");
+  const isOIDC = capabilities?.auth_mode === "oidc";
   return (
     <div className="auth-controls">
       <LanguageToggle />
@@ -382,20 +565,26 @@ function AuthControls({
           {permissions.length > 5 ? <code>+{permissions.length - 5}</code> : null}
         </div>
       ) : null}
-      <input
-        aria-label={t("auth.bearerToken")}
-        placeholder={t("auth.bearerToken")}
-        type="password"
-        value={tokenDraft}
-        onChange={(event) => onTokenDraftChange(event.target.value)}
-      />
+      {isOIDC ? (
+        <input
+          aria-label={t("auth.bearerToken")}
+          placeholder={t("auth.bearerToken")}
+          type="password"
+          value={tokenDraft}
+          onChange={(event) => onTokenDraftChange(event.target.value)}
+        />
+      ) : null}
       <div className="auth-actions">
-        <button className="secondary-button" type="button" onClick={onOIDCLogin}>
-          {t("auth.signIn")}
-        </button>
-        <button className="secondary-button" type="button" disabled={isConnecting} onClick={onSaveToken}>
-          {isConnecting ? t("auth.connecting") : t("auth.connect")}
-        </button>
+        {isOIDC ? (
+          <>
+            <button className="secondary-button" type="button" onClick={onOIDCLogin}>
+              {t("auth.signIn")}
+            </button>
+            <button className="secondary-button" type="button" disabled={isConnecting} onClick={onSaveToken}>
+              {isConnecting ? t("auth.connecting") : t("auth.connect")}
+            </button>
+          </>
+        ) : null}
         <button className="secondary-button" type="button" disabled={isLoggingOut} onClick={onLogout}>
           {t("auth.signOut")}
         </button>
@@ -404,19 +593,111 @@ function AuthControls({
   );
 }
 
-function LoginPanel({
+function LoginPage({
+  auth,
   capabilities,
   authError,
   isConnecting,
+  isPasswordLoginPending,
+  loginEmail,
+  loginPassword,
+  onLoginEmailChange,
+  onLoginPasswordChange,
+  onPasswordLogin,
   onOIDCLogin,
+  onOpenConsole,
   onSaveToken,
   tokenDraft,
   onTokenDraftChange
 }: {
+  auth?: AuthContext;
   capabilities?: AuthCapabilities;
   authError: Error | null;
   isConnecting: boolean;
+  isPasswordLoginPending: boolean;
+  loginEmail: string;
+  loginPassword: string;
+  onLoginEmailChange: (value: string) => void;
+  onLoginPasswordChange: (value: string) => void;
+  onPasswordLogin: () => void;
   onOIDCLogin: () => void;
+  onOpenConsole: () => void;
+  onSaveToken: () => void;
+  tokenDraft: string;
+  onTokenDraftChange: (value: string) => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <main className="login-page">
+      <section className="login-hero">
+        <div className="login-brand">
+          <span className="brand-mark">mcx</span>
+          <div>
+            <h1>multi-codex</h1>
+            <p>{t("auth.enterpriseSubtitle")}</p>
+          </div>
+        </div>
+        <div className="login-copy">
+          <p className="eyebrow">{t("auth.secureWorkspace")}</p>
+          <h2>{t("auth.loginHeroTitle")}</h2>
+          <p>{t("auth.loginHeroBody")}</p>
+        </div>
+        <div className="login-assurance">
+          <span>{t("auth.assuranceEnvelope")}</span>
+          <span>{t("auth.assuranceRbac")}</span>
+          <span>{t("auth.assuranceAudit")}</span>
+        </div>
+      </section>
+      <LoginPanel
+        auth={auth}
+        authError={authError}
+        capabilities={capabilities}
+        isConnecting={isConnecting}
+        isPasswordLoginPending={isPasswordLoginPending}
+        loginEmail={loginEmail}
+        loginPassword={loginPassword}
+        onLoginEmailChange={onLoginEmailChange}
+        onLoginPasswordChange={onLoginPasswordChange}
+        onPasswordLogin={onPasswordLogin}
+        onOIDCLogin={onOIDCLogin}
+        onOpenConsole={onOpenConsole}
+        onSaveToken={onSaveToken}
+        onTokenDraftChange={onTokenDraftChange}
+        tokenDraft={tokenDraft}
+      />
+    </main>
+  );
+}
+
+function LoginPanel({
+  auth,
+  capabilities,
+  authError,
+  isConnecting,
+  isPasswordLoginPending,
+  loginEmail,
+  loginPassword,
+  onLoginEmailChange,
+  onLoginPasswordChange,
+  onPasswordLogin,
+  onOIDCLogin,
+  onOpenConsole,
+  onSaveToken,
+  tokenDraft,
+  onTokenDraftChange
+}: {
+  auth?: AuthContext;
+  capabilities?: AuthCapabilities;
+  authError: Error | null;
+  isConnecting: boolean;
+  isPasswordLoginPending: boolean;
+  loginEmail: string;
+  loginPassword: string;
+  onLoginEmailChange: (value: string) => void;
+  onLoginPasswordChange: (value: string) => void;
+  onPasswordLogin: () => void;
+  onOIDCLogin: () => void;
+  onOpenConsole?: () => void;
   onSaveToken: () => void;
   tokenDraft: string;
   onTokenDraftChange: (value: string) => void;
@@ -442,28 +723,66 @@ function LoginPanel({
       <div className="login-meta">
         <span>{helperText}</span>
         {ttlHours ? <code>{t("auth.sessionTtl", { hours: ttlHours })}</code> : null}
-        {capabilities?.default_role ? <code>{t("auth.defaultRole", { role: capabilities.default_role })}</code> : null}
+        {capabilities?.default_role ? <code>{t("auth.defaultRole", { role: roleLabel(capabilities.default_role, t) })}</code> : null}
         {authError ? <code>{authError.message}</code> : null}
       </div>
       <div className="login-actions">
-        <button className="primary-button" type="button" onClick={onOIDCLogin}>
-          {t("auth.signIn")}
-        </button>
-        <div className="token-exchange">
-          <label>
-            {t("auth.bearerToken")}
-            <input
-              aria-label={t("auth.bearerToken")}
-              type="password"
-              value={tokenDraft}
-              onChange={(event) => onTokenDraftChange(event.target.value)}
-              placeholder={t("auth.tokenHelp")}
-            />
-          </label>
-          <button className="secondary-button" type="button" disabled={isConnecting} onClick={onSaveToken}>
-            {isConnecting ? t("auth.connecting") : t("auth.connect")}
+        {auth ? (
+          <button className="primary-button" type="button" onClick={onOpenConsole}>
+            {t("auth.openConsole")}
           </button>
-        </div>
+        ) : !isOIDC ? (
+          <form className="credential-login" onSubmit={(event) => submit(event, onPasswordLogin)}>
+            <label>
+              {t("auth.email")}
+              <input
+                aria-label={t("auth.email")}
+                autoComplete="username"
+                value={loginEmail}
+                onChange={(event) => onLoginEmailChange(event.target.value)}
+                placeholder={t("auth.emailPlaceholder")}
+              />
+            </label>
+            <label>
+              {t("auth.password")}
+              <input
+                aria-label={t("auth.password")}
+                autoComplete="current-password"
+                type="password"
+                value={loginPassword}
+                onChange={(event) => onLoginPasswordChange(event.target.value)}
+                placeholder={t("auth.passwordPlaceholder")}
+              />
+            </label>
+            <button className="primary-button" type="submit" disabled={isPasswordLoginPending}>
+              {isPasswordLoginPending ? t("auth.connecting") : t("auth.signIn")}
+            </button>
+          </form>
+        ) : (
+          <button className="primary-button" type="button" onClick={onOIDCLogin}>
+            {t("auth.signIn")}
+          </button>
+        )}
+        {isOIDC ? (
+          <details className="advanced-login">
+            <summary>{t("auth.advancedLogin")}</summary>
+            <div className="token-exchange">
+              <label>
+                {t("auth.bearerToken")}
+                <input
+                  aria-label={t("auth.bearerToken")}
+                  type="password"
+                  value={tokenDraft}
+                  onChange={(event) => onTokenDraftChange(event.target.value)}
+                  placeholder={t("auth.tokenHelp")}
+                />
+              </label>
+              <button className="secondary-button" type="button" disabled={isConnecting} onClick={onSaveToken}>
+                {isConnecting ? t("auth.connecting") : t("auth.connect")}
+              </button>
+            </div>
+          </details>
+        ) : null}
       </div>
     </section>
   );
@@ -621,6 +940,7 @@ function ActiveTasksPanel({
       return ["done", "completed", "succeeded", "approved"].includes(task.status);
     });
   }, [filter, tasks]);
+  const pagination = useListPagination(visibleTasks);
 
   return (
     <section className="panel cockpit-panel active-tasks-panel">
@@ -629,9 +949,12 @@ function ActiveTasksPanel({
           <p className="eyebrow">{t("dashboard.workQueue")}</p>
           <h3>{t("dashboard.activeTasks")}</h3>
         </div>
-        <span>{t("common.total", { count: tasks.length })}</span>
+        <div className="panel-heading-actions">
+          <span>{t("common.total", { count: tasks.length })}</span>
+          <ListPaginationControl pagination={pagination} />
+        </div>
       </div>
-      <div className="segment-group" role="tablist" aria-label="Task filters">
+      <div className="segment-group" role="tablist" aria-label={t("tasks.filters")}>
         {(["all", "queued", "running", "blocked", "done"] as TaskFilter[]).map((item) => (
           <button
             aria-selected={filter === item}
@@ -645,9 +968,9 @@ function ActiveTasksPanel({
           </button>
         ))}
       </div>
-      <div className="task-list cockpit-task-list">
+      <div className="task-list cockpit-task-list dashboard-list">
         {visibleTasks.length ? (
-          visibleTasks.slice(0, 8).map((task) => (
+          pagination.items.map((task) => (
             <TaskRow key={task.id} task={task} active={task.id === selectedTask?.id} onSelect={() => onSelectTask(task.id)} />
           ))
         ) : (
@@ -675,6 +998,7 @@ function QueueHealthCard({ onSelectView, queue, runs }: { onSelectView: (view: V
   const blocked = runs.filter((run) => ["blocked", "failed"].includes(run.status)).length;
   const completed = runs.filter((run) => ["completed", "succeeded"].includes(run.status)).length;
   const snapshots = Object.values(queue?.backpressure ?? {});
+  const pagination = useListPagination(snapshots);
 
   return (
     <section className="panel cockpit-panel">
@@ -683,7 +1007,10 @@ function QueueHealthCard({ onSelectView, queue, runs }: { onSelectView: (view: V
           <p className="eyebrow">{t("dashboard.capacity")}</p>
           <h3>{t("dashboard.queueHealth")}</h3>
         </div>
-        <span>{new Date().toLocaleTimeString()}</span>
+        <div className="panel-heading-actions">
+          <span>{new Date().toLocaleTimeString()}</span>
+          <ListPaginationControl pagination={pagination} />
+        </div>
       </div>
       <div className="queue-stats">
         <Metric label={t("summary.queued")} value={queued} />
@@ -691,9 +1018,9 @@ function QueueHealthCard({ onSelectView, queue, runs }: { onSelectView: (view: V
         <Metric label={t("filters.blocked")} value={blocked} />
         <Metric label={t("filters.done")} value={completed} />
       </div>
-      <div className="capacity-list">
+      <div className="capacity-list dashboard-list">
         {snapshots.length ? (
-          snapshots.map((snapshot) => (
+          pagination.items.map((snapshot) => (
             <div className="capacity-row" key={snapshot.executor}>
               <div>
                 <strong>{labelize(snapshot.executor)}</strong>
@@ -808,7 +1135,7 @@ function TaskLifecyclePanel({
           </div>
           <div className="task-meta">
             <StatusBadge status={task.status} />
-            <span>{role}</span>
+            <span>{roleLabel(role, t)}</span>
             <span>{executor}</span>
             <span>{t("common.recent", { count: runs.length })}</span>
           </div>
@@ -849,7 +1176,7 @@ function TaskLifecyclePanel({
             onClick={() => workflowMutation.mutate(action)}
             type="button"
           >
-            {labelize(action)}
+            {workflowActionLabel(action, t)}
           </button>
         ))}
       </div>
@@ -903,7 +1230,7 @@ function TaskLifecyclePanel({
           rows={[
             [t("tasks.executor"), latestRun?.executor ?? executor],
             [t("lifecycle.node"), latestRun?.executor_node_id ?? t("common.notAssigned")],
-            [t("lifecycle.worktree"), latestRun?.worktree_path ?? "ephemeral"]
+            [t("lifecycle.worktree"), latestRun?.worktree_path ?? t("common.ephemeral")]
           ]}
         />
         <LifecycleStep
@@ -912,7 +1239,7 @@ function TaskLifecyclePanel({
           title={t("lifecycle.auditApproval")}
           rows={[
             [t("lifecycle.approvals"), t("lifecycle.approvalsRequested", { count: taskApprovals.length })],
-            [t("lifecycle.readyForPr"), workflow.data?.ready_for_pr ? "yes" : "no"],
+            [t("lifecycle.readyForPr"), workflow.data?.ready_for_pr ? t("common.yes") : t("common.no")],
             [t("lifecycle.latestRun"), latestRun?.id ?? t("common.noRun")]
           ]}
         />
@@ -965,6 +1292,8 @@ function EvidenceColumn({
   toolCalls: ToolCall[];
 }) {
   const { t } = useI18n();
+  const toolPagination = useListPagination(toolCalls);
+  const auditPagination = useListPagination(auditLogs);
   return (
     <div className="cockpit-stack evidence-stack">
       <LiveRunCard run={latestRun} />
@@ -974,13 +1303,16 @@ function EvidenceColumn({
             <p className="eyebrow">{t("dashboard.gateway")}</p>
             <h3>{t("dashboard.toolCalls")}</h3>
           </div>
-          <button className="link-button" onClick={() => onSelectView("audit")} type="button">
-            {t("dashboard.viewAll")}
-          </button>
+          <div className="panel-heading-actions">
+            <ListPaginationControl pagination={toolPagination} />
+            <button className="link-button" onClick={() => onSelectView("audit")} type="button">
+              {t("dashboard.viewAll")}
+            </button>
+          </div>
         </div>
-        <div className="table-list compact-evidence">
+        <div className="table-list compact-evidence dashboard-list">
           {toolCalls.length ? (
-            toolCalls.slice(0, 6).map((call) => (
+            toolPagination.items.map((call) => (
               <div className="data-row evidence-row" key={call.id}>
                 <div>
                   <strong>{call.tool_name}</strong>
@@ -1002,11 +1334,14 @@ function EvidenceColumn({
             <p className="eyebrow">{t("dashboard.evidence")}</p>
             <h3>{t("dashboard.auditTrail")}</h3>
           </div>
-          <button className="link-button" onClick={() => onSelectView("audit")} type="button">
-            {t("dashboard.stream")}
-          </button>
+          <div className="panel-heading-actions">
+            <ListPaginationControl pagination={auditPagination} />
+            <button className="link-button" onClick={() => onSelectView("audit")} type="button">
+              {t("dashboard.stream")}
+            </button>
+          </div>
         </div>
-        <CompactAuditList entries={auditLogs} limit={8} />
+        <CompactAuditList entries={auditPagination.items} className="dashboard-list" />
       </section>
     </div>
   );
@@ -1015,15 +1350,19 @@ function EvidenceColumn({
 function LiveRunCard({ run }: { run?: Run }) {
   const { t } = useI18n();
   const events = useRunEvents(run?.id, run?.status);
+  const eventPagination = useListPagination(events.events, { fromEnd: true });
 
   return (
     <section className="panel cockpit-panel">
       <div className="panel-heading">
         <div>
           <p className="eyebrow">{t("dashboard.worker")}</p>
-          <h3>{run ? `${run.role} ${t("nav.runs")}` : t("dashboard.liveRun")}</h3>
+          <h3>{run ? t("runs.runTitle", { role: roleLabel(run.role, t) }) : t("dashboard.liveRun")}</h3>
         </div>
-        <StatusBadge status={run?.status ?? "idle"} />
+        <div className="panel-heading-actions">
+          <ListPaginationControl pagination={eventPagination} />
+          <StatusBadge status={run?.status ?? "idle"} />
+        </div>
       </div>
       {run ? (
         <>
@@ -1034,7 +1373,7 @@ function LiveRunCard({ run }: { run?: Run }) {
             </div>
             <div>
               <dt>{t("runs.started")}</dt>
-              <dd>{formatDate(run.started_at ?? run.created_at)}</dd>
+              <dd>{formatDate(run.started_at ?? run.created_at, t)}</dd>
             </div>
             <div>
               <dt>{t("lifecycle.node")}</dt>
@@ -1045,7 +1384,7 @@ function LiveRunCard({ run }: { run?: Run }) {
               <dd>{run.branch ?? t("status.pending")}</dd>
             </div>
           </dl>
-          <EventList events={events.events.slice(-5)} streamState={events.streamState} />
+          <EventList events={eventPagination.items} streamState={events.streamState} />
         </>
       ) : (
         <div className="empty-state compact">{t("runs.noRuns")}</div>
@@ -1062,6 +1401,8 @@ function ArtifactSummary({ run }: { run?: Run }) {
     enabled: Boolean(run),
     refetchInterval: pollWhileHealthy(run?.status === "running" ? 2_000 : 5_000)
   });
+  const artifactList = artifacts.data ?? [];
+  const pagination = useListPagination(artifactList);
 
   return (
     <section className="panel cockpit-panel">
@@ -1069,18 +1410,21 @@ function ArtifactSummary({ run }: { run?: Run }) {
         <div>
             <p className="eyebrow">{t("dashboard.outputs")}</p>
             <h3>{t("dashboard.artifacts")}</h3>
-          </div>
-        <span>{t("common.files", { count: artifacts.data?.length ?? 0 })}</span>
+        </div>
+        <div className="panel-heading-actions">
+          <span>{t("common.files", { count: artifactList.length })}</span>
+          <ListPaginationControl pagination={pagination} />
+        </div>
       </div>
-      <div className="table-list compact-evidence">
-        {artifacts.data?.length ? (
-          artifacts.data.slice(0, 5).map((artifact) => (
+      <div className="table-list compact-evidence dashboard-list">
+        {artifactList.length ? (
+          pagination.items.map((artifact) => (
             <div className="data-row evidence-row" key={artifact.id}>
               <div>
                 <strong>{artifact.name}</strong>
                 <code>{artifact.kind}</code>
               </div>
-              <span>{artifact.size_bytes ?? 0} bytes</span>
+              <span>{t("common.bytes", { count: artifact.size_bytes ?? 0 })}</span>
               <code>{artifact.sha256?.slice(0, 12) ?? t("common.noHash")}</code>
             </div>
           ))
@@ -1132,7 +1476,7 @@ function ProjectRepoPanel({ activeProjectId }: { activeProjectId?: string }) {
           <input value={projectName} onChange={(event) => setProjectName(event.target.value)} />
         </label>
         <label>
-          Slug
+          {t("common.slug")}
           <input value={projectSlug} onChange={(event) => setProjectSlug(event.target.value)} />
         </label>
         <button className="primary-button" type="submit" disabled={createProjectMutation.isPending || !access.has("projects:write")}>
@@ -1152,7 +1496,7 @@ function ProjectRepoPanel({ activeProjectId }: { activeProjectId?: string }) {
           <input value={repoName} onChange={(event) => setRepoName(event.target.value)} />
         </label>
         <label>
-          Remote URL
+          {t("common.remoteUrl")}
           <input value={remoteURL} onChange={(event) => setRemoteURL(event.target.value)} />
         </label>
         <button className="primary-button" type="submit" disabled={!activeProjectId || createRepoMutation.isPending || !access.has("repositories:write")}>
@@ -1177,17 +1521,21 @@ function TasksView({
   tasks: Task[];
 }) {
   const { t } = useI18n();
+  const pagination = useListPagination(tasks);
   return (
-    <section className="content-grid">
+    <section className="content-grid tasks-layout">
       <div className="panel">
         <div className="panel-heading">
           <h3>{t("nav.tasks")}</h3>
-          <span>{t("common.total", { count: tasks.length })}</span>
+          <div className="panel-heading-actions">
+            <span>{t("common.total", { count: tasks.length })}</span>
+            <ListPaginationControl pagination={pagination} />
+          </div>
         </div>
         <TaskCreateForm activeProject={activeProject} activeRepository={activeRepository} />
-        <div className="task-list">
+        <div className="task-list bounded-list">
           {tasks.length ? (
-            tasks.map((task) => (
+            pagination.items.map((task) => (
               <TaskRow key={task.id} task={task} active={task.id === selectedTask?.id} onSelect={() => onSelectTask(task.id)} />
             ))
           ) : (
@@ -1204,9 +1552,9 @@ function TasksView({
 function TaskCreateForm({ activeProject, activeRepository }: { activeProject?: Project; activeRepository?: Repository }) {
   const { t } = useI18n();
   const access = useAccess();
-  const [title, setTitle] = useState("Implement governed lifecycle check");
+  const [title, setTitle] = useState(t("tasks.defaultTitle"));
   const [allowedPaths, setAllowedPaths] = useState("internal/**\napps/web/src/**\ndocs/**");
-  const [objective, setObjective] = useState("Run a scoped feature worker and collect verifiable artifacts.");
+  const [objective, setObjective] = useState(t("tasks.defaultObjective"));
   const mutation = useMutation({
     mutationFn: () =>
       createTask(activeProject!, activeRepository!, {
@@ -1281,6 +1629,8 @@ function TaskDetail({ task }: { task?: Task }) {
   });
   const latestRun = runs.data?.[runs.data.length - 1];
   const events = useRunEvents(latestRun?.id, latestRun?.status);
+  const runPagination = useListPagination(runs.data ?? []);
+  const eventPagination = useListPagination(events.events, { fromEnd: true });
   const startMutation = useMutation({
     mutationFn: async () => startTask(task!.id),
     onSuccess: (run) => refreshTaskQueries(task, run.id)
@@ -1335,7 +1685,7 @@ function TaskDetail({ task }: { task?: Task }) {
         </div>
         <div>
           <dt>{t("tasks.role")}</dt>
-          <dd>{String(task.envelope.role ?? "feature")}</dd>
+          <dd>{roleLabel(String(task.envelope.role ?? "feature"), t)}</dd>
         </div>
         <div>
           <dt>{t("tasks.executor")}</dt>
@@ -1357,7 +1707,7 @@ function TaskDetail({ task }: { task?: Task }) {
             disabled={workflowMutation.isPending || !access.has("runs:write") || action === "worker_spawn" || action === "policy_validate_task" || action === "approval_status" || action === "completed"}
             onClick={() => workflowMutation.mutate(action)}
           >
-            {action}
+            {workflowActionLabel(action, t)}
           </button>
         ))}
         <button className="secondary-button" onClick={() => approvalMutation.mutate()} disabled={approvalMutation.isPending || !access.has("approvals:write")}>
@@ -1383,13 +1733,16 @@ function TaskDetail({ task }: { task?: Task }) {
         </div>
       ) : null}
 
-      <h4 className="section-title">{t("tasks.runs")}</h4>
-      <div className="run-list">
+      <div className="section-title-row list-section-title">
+        <h4 className="section-title">{t("tasks.runs")}</h4>
+        <ListPaginationControl pagination={runPagination} />
+      </div>
+      <div className="run-list bounded-list compact-bounded-list">
         {!access.has("runs:read") ? <AccessNotice permission="runs:read" /> : null}
         {runs.data?.length ? (
-          runs.data.map((run) => (
+          runPagination.items.map((run) => (
             <div className="run-row" key={run.id}>
-              <span>{run.role}</span>
+              <span>{roleLabel(run.role, t)}</span>
               <StatusBadge status={run.status} />
               <code>{run.executor}</code>
               <code>{run.executor_node_id || t("common.notAssigned")}</code>
@@ -1400,8 +1753,11 @@ function TaskDetail({ task }: { task?: Task }) {
         )}
       </div>
 
-      <h4 className="section-title">{t("tasks.latestRunEvents")}</h4>
-      <EventList events={events.events} streamState={events.streamState} />
+      <div className="section-title-row list-section-title">
+        <h4 className="section-title">{t("tasks.latestRunEvents")}</h4>
+        <ListPaginationControl pagination={eventPagination} />
+      </div>
+      <EventList events={eventPagination.items} streamState={events.streamState} />
 
       <h4 className="section-title">{t("tasks.latestRunArtifacts")}</h4>
       <RunArtifactInspector runId={latestRun?.id} runStatus={latestRun?.status} />
@@ -1418,6 +1774,7 @@ function RunsView() {
   const runs = useQuery({ queryKey: ["runs"], queryFn: listAllRuns, enabled: access.has("runs:read"), refetchInterval: pollWhileHealthy(2_000) });
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>();
   const runList = useMemo(() => runs.data ?? [], [runs.data]);
+  const pagination = useListPagination(runList);
   const selectedRun = runList.find((run) => run.id === selectedRunId) ?? runList[0];
 
   useEffect(() => {
@@ -1431,15 +1788,18 @@ function RunsView() {
   }, [runList, selectedRunId]);
 
   return (
-    <section className="content-grid">
+    <section className="content-grid runs-layout">
       <div className="panel">
         <div className="panel-heading">
           <h3>{t("nav.runs")}</h3>
-          <span>{runs.isLoading ? t("common.loading") : t("common.recent", { count: runList.length })}</span>
+          <div className="panel-heading-actions">
+            <span>{runs.isLoading ? t("common.loading") : t("common.recent", { count: runList.length })}</span>
+            <ListPaginationControl pagination={pagination} />
+          </div>
         </div>
-        <div className="table-list">
+        <div className="table-list bounded-list">
           {runList.length ? (
-            runList.map((run) => (
+            pagination.items.map((run) => (
               <button
                 className={`data-row selectable-row ${run.id === selectedRun?.id ? "is-selected" : ""}`}
                 key={run.id}
@@ -1447,7 +1807,7 @@ function RunsView() {
                 type="button"
               >
                 <div>
-                  <strong>{run.role}</strong>
+                  <strong>{roleLabel(run.role, t)}</strong>
                   <code>{run.id}</code>
                 </div>
                 <StatusBadge status={run.status} />
@@ -1481,33 +1841,38 @@ function QueueView() {
   });
   const queuedRuns = queue.data?.queued_runs ?? [];
   const backpressure = queue.data?.backpressure ?? {};
+  const pagination = useListPagination(queuedRuns);
 
   return (
-    <section className="content-grid">
+    <section className="content-grid queue-layout">
       <div className="panel">
         <div className="panel-heading">
           <h3>{t("queue.workerQueue")}</h3>
-          <div className="actions">
+          <div className="panel-heading-actions">
             <span>{queue.isLoading ? t("common.loading") : t("common.recent", { count: queuedRuns.length })}</span>
+            <ListPaginationControl pagination={pagination} />
             <button className="secondary-button" onClick={() => dispatchMutation.mutate()} disabled={dispatchMutation.isPending || !access.has("runs:write")}>
               {t("queue.dispatch")}
             </button>
           </div>
         </div>
-        <div className="table-list">
+        <div className="table-list bounded-list">
           {queuedRuns.length ? (
-            queuedRuns.map((run) => (
+            pagination.items.map((run) => (
               <div className="data-row" key={run.id}>
                 <div>
-                  <strong>{run.role}</strong>
+                  <strong>{roleLabel(run.role, t)}</strong>
                   <code>{run.id}</code>
                 </div>
                 <StatusBadge status={run.status} />
                 <span>{run.executor}</span>
                 <code>{queueValue(run, "queued_reason", "queued")}</code>
                 <code>
-                  priority {queueValue(run, "queue_priority", "0")} · attempt {queueValue(run, "retry_attempt", "1")}/
-                  {queueValue(run, "max_attempts", "1")}
+                  {t("queue.priorityAttempt", {
+                    priority: queueValue(run, "queue_priority", "0"),
+                    attempt: queueValue(run, "retry_attempt", "1"),
+                    max: queueValue(run, "max_attempts", "1")
+                  })}
                 </code>
               </div>
             ))
@@ -1523,7 +1888,7 @@ function QueueView() {
           <StatusBadge status={dispatchMutation.isError ? "blocked" : "ready"} />
         </div>
         {dispatchMutation.isError ? (
-          <div className="empty-state compact">{dispatchMutation.error instanceof Error ? dispatchMutation.error.message : "Dispatch failed."}</div>
+          <div className="empty-state compact">{dispatchMutation.error instanceof Error ? dispatchMutation.error.message : t("queue.dispatchFailed")}</div>
         ) : null}
         <BackpressureSection title="Docker" snapshot={backpressure.docker} />
         <BackpressureSection title="SSH" snapshot={backpressure.ssh} />
@@ -1534,6 +1899,7 @@ function QueueView() {
 
 function BackpressureSection({ title, snapshot }: { title: string; snapshot?: Backpressure }) {
   const { t } = useI18n();
+  const pagination = useListPagination(snapshot?.nodes ?? []);
   return (
     <div className="node-section">
       <div className="section-title-row">
@@ -1542,12 +1908,13 @@ function BackpressureSection({ title, snapshot }: { title: string; snapshot?: Ba
           <div className="capacity-summary">
             <span>{t("common.free", { count: snapshot.available_slots })}</span>
             <span>{t("common.retrySeconds", { count: snapshot.retry_after_seconds })}</span>
+            <ListPaginationControl pagination={pagination} />
           </div>
         ) : null}
       </div>
       {snapshot?.nodes.length ? (
-        <div className="node-list">
-          {snapshot.nodes.map((node) => (
+        <div className="node-list bounded-list compact-bounded-list">
+          {pagination.items.map((node) => (
             <div className="node-row" key={node.id}>
               <div className="node-primary">
                 <strong>{node.name}</strong>
@@ -1588,6 +1955,7 @@ function queueValue(run: Run, key: string, fallback: string) {
 function RunDetail({ run }: { run?: Run }) {
   const { t } = useI18n();
   const events = useRunEvents(run?.id, run?.status);
+  const eventPagination = useListPagination(events.events, { fromEnd: true });
 
   if (!run) {
     return (
@@ -1600,7 +1968,7 @@ function RunDetail({ run }: { run?: Run }) {
   return (
     <div className="panel detail-panel">
       <div className="panel-heading">
-        <h3>{run.role} Run</h3>
+        <h3>{t("runs.runTitle", { role: roleLabel(run.role, t) })}</h3>
         <StatusBadge status={run.status} />
       </div>
       <dl className="detail-list">
@@ -1626,8 +1994,11 @@ function RunDetail({ run }: { run?: Run }) {
         </div>
       </dl>
 
-      <h4 className="section-title">{t("runs.events")}</h4>
-      <EventList events={events.events} streamState={events.streamState} />
+      <div className="section-title-row list-section-title">
+        <h4 className="section-title">{t("runs.events")}</h4>
+        <ListPaginationControl pagination={eventPagination} />
+      </div>
+      <EventList events={eventPagination.items} streamState={events.streamState} />
 
       <h4 className="section-title">{t("runs.artifacts")}</h4>
       <RunArtifactInspector runId={run.id} runStatus={run.status} />
@@ -1649,6 +2020,7 @@ function RunArtifactInspector({ runId, runStatus }: { runId?: string; runStatus?
     refetchInterval: pollWhileHealthy(runStatus === "running" ? 2_000 : 5_000)
   });
   const artifactList = useMemo(() => artifacts.data ?? [], [artifacts.data]);
+  const pagination = useListPagination(artifactList);
   const selectedArtifact = artifactList.find((artifact) => artifact.id === selectedArtifactId);
   const artifactContent = useQuery({
     queryKey: ["artifact-content", selectedArtifactId],
@@ -1673,9 +2045,13 @@ function RunArtifactInspector({ runId, runStatus }: { runId?: string; runStatus?
 
   return (
     <div className="artifact-shell">
-      <div className="table-list compact-table artifact-list">
+      <div className="inline-list-toolbar">
+        <span>{t("common.files", { count: artifactList.length })}</span>
+        <ListPaginationControl pagination={pagination} />
+      </div>
+      <div className="table-list compact-table artifact-list bounded-list compact-bounded-list">
         {artifactList.length ? (
-          artifactList.map((artifact) => (
+          pagination.items.map((artifact) => (
             <button
               className={`data-row artifact-row ${artifact.id === selectedArtifactId ? "is-selected" : ""}`}
               key={artifact.id}
@@ -1686,7 +2062,7 @@ function RunArtifactInspector({ runId, runStatus }: { runId?: string; runStatus?
                 <strong>{artifact.name}</strong>
                 <code>{artifact.kind}</code>
               </div>
-              <span>{artifact.size_bytes ?? 0} bytes</span>
+              <span>{t("common.bytes", { count: artifact.size_bytes ?? 0 })}</span>
               <code>{artifact.sha256?.slice(0, 16) ?? t("common.noHash")}</code>
               <code>{artifact.path}</code>
             </button>
@@ -1723,6 +2099,7 @@ function SkillsView({ projectId }: { projectId?: string }) {
   const skills = useQuery({ queryKey: ["skills"], queryFn: listSkills, enabled: access.has("projects:read") });
   const skillList = useMemo(() => skills.data ?? [], [skills.data]);
   const [selectedSkillId, setSelectedSkillId] = useState<string | undefined>();
+  const skillPagination = useListPagination(skillList);
   const selectedSkill = skillList.find((skill) => skill.id === selectedSkillId) ?? skillList[0];
   const versions = useQuery({
     queryKey: ["skill-versions", selectedSkill?.id],
@@ -1734,6 +2111,7 @@ function SkillsView({ projectId }: { projectId?: string }) {
     queryFn: () => listAgentProfiles(projectId!),
     enabled: Boolean(projectId) && access.has("projects:read")
   });
+  const profilePagination = useListPagination(profiles.data ?? []);
   const [skillName, setSkillName] = useState("company-docs-worker");
   const [skillRole, setSkillRole] = useState("docs");
   const [profileName, setProfileName] = useState("docs-worker");
@@ -1782,11 +2160,14 @@ function SkillsView({ projectId }: { projectId?: string }) {
   }, [skillList, selectedSkillId]);
 
   return (
-    <section className="content-grid">
+    <section className="content-grid skills-layout">
       <div className="panel">
         <div className="panel-heading">
           <h3>{t("skills.skills")}</h3>
-          <span>{t("common.registered", { count: skills.data?.length ?? 0 })}</span>
+          <div className="panel-heading-actions">
+            <span>{t("common.registered", { count: skills.data?.length ?? 0 })}</span>
+            <ListPaginationControl pagination={skillPagination} />
+          </div>
         </div>
         {!access.has("skills:write") ? <AccessNotice permission="skills:write" /> : null}
         <form className="form-grid bordered" onSubmit={(event) => submit(event, () => skillMutation.mutate())}>
@@ -1802,8 +2183,8 @@ function SkillsView({ projectId }: { projectId?: string }) {
             {t("skills.registerSkill")}
           </button>
         </form>
-        <div className="table-list">
-          {skillList.map((skill) => (
+        <div className="table-list bounded-list">
+          {skillPagination.items.map((skill) => (
             <button className={`data-row selectable-row ${skill.id === selectedSkill?.id ? "is-selected" : ""}`} key={skill.id} onClick={() => setSelectedSkillId(skill.id)}>
               <div>
                 <strong>{skill.name}</strong>
@@ -1811,7 +2192,7 @@ function SkillsView({ projectId }: { projectId?: string }) {
               </div>
               <StatusBadge status={skill.enabled ? "enabled" : "disabled"} />
               <span>{skill.role}</span>
-              <code>{skill.path ?? "no path"}</code>
+              <code>{skill.path ?? t("common.noPath")}</code>
             </button>
           ))}
         </div>
@@ -1821,7 +2202,10 @@ function SkillsView({ projectId }: { projectId?: string }) {
       <div className="panel">
         <div className="panel-heading">
           <h3>{t("skills.agentProfiles")}</h3>
-          <span>{t("common.profiles", { count: profiles.data?.length ?? 0 })}</span>
+          <div className="panel-heading-actions">
+            <span>{t("common.profiles", { count: profiles.data?.length ?? 0 })}</span>
+            <ListPaginationControl pagination={profilePagination} />
+          </div>
         </div>
         {!access.has("projects:write") ? <AccessNotice permission="projects:write" /> : null}
         <form className="form-grid bordered" onSubmit={(event) => submit(event, () => profileMutation.mutate())}>
@@ -1849,8 +2233,8 @@ function SkillsView({ projectId }: { projectId?: string }) {
             {t("skills.createProfile")}
           </button>
         </form>
-        <div className="table-list">
-          {profiles.data?.map((profile) => (
+        <div className="table-list bounded-list">
+          {profilePagination.items.map((profile) => (
             <div className="data-row" key={profile.id}>
               <div>
                 <strong>{profile.name}</strong>
@@ -1859,7 +2243,7 @@ function SkillsView({ projectId }: { projectId?: string }) {
               <StatusBadge status={profile.executor} />
               <span>{profile.role}</span>
               <code>{profile.network_enabled ? t("skills.networkOn") : t("skills.networkOff")}</code>
-              <code>{profileSecretEnvLabel(profile)}</code>
+              <code>{profileSecretEnvLabel(profile, t)}</code>
             </div>
           ))}
         </div>
@@ -1870,19 +2254,26 @@ function SkillsView({ projectId }: { projectId?: string }) {
 
 function SkillVersionList({ versions }: { versions: SkillVersion[] }) {
   const { t } = useI18n();
+  const pagination = useListPagination(versions);
   return (
-    <div className="version-list">
-      {versions.length ? (
-        versions.map((version) => (
-          <div className="version-row" key={version.id}>
-            <strong>{version.version}</strong>
-            <code>{version.content_hash}</code>
-            <code>{version.path}</code>
-          </div>
-        ))
-      ) : (
-        <div className="empty-state compact">{t("skills.noVersions")}</div>
-      )}
+    <div className="version-shell">
+      <div className="inline-list-toolbar">
+        <span>{t("common.total", { count: versions.length })}</span>
+        <ListPaginationControl pagination={pagination} />
+      </div>
+      <div className="version-list bounded-list compact-bounded-list">
+        {versions.length ? (
+          pagination.items.map((version) => (
+            <div className="version-row" key={version.id}>
+              <strong>{version.version}</strong>
+              <code>{version.content_hash}</code>
+              <code>{version.path}</code>
+            </div>
+          ))
+        ) : (
+          <div className="empty-state compact">{t("skills.noVersions")}</div>
+        )}
+      </div>
     </div>
   );
 }
@@ -1901,22 +2292,328 @@ function parseListInput(value: string): string[] {
   return values;
 }
 
-function profileSecretEnvLabel(profile: AgentProfile): string {
+function profileSecretEnvLabel(profile: AgentProfile, t: (key: string) => string): string {
   const value = profile.config["worker_secret_env"] ?? profile.config["secret_env"];
   if (Array.isArray(value)) {
     const names = value.filter((item): item is string => typeof item === "string");
-    return names.length ? names.join(", ") : "no secret refs";
+    return names.length ? names.join(", ") : t("common.noSecretRefs");
   }
   if (typeof value === "string" && value.trim()) {
     return value;
   }
-  return "no secret refs";
+  return t("common.noSecretRefs");
+}
+
+function AdminView({
+  activeProject,
+  onSelectProject,
+  projects,
+  users
+}: {
+  activeProject?: Project;
+  onSelectProject: (projectId: string) => void;
+  projects: Project[];
+  users?: UserDirectory;
+}) {
+  const { t } = useI18n();
+  const access = useAccess();
+  const [email, setEmail] = useState("teammate@example.com");
+  const [displayName, setDisplayName] = useState("Teammate");
+  const [orgRole, setOrgRole] = useState("viewer");
+  const [password, setPassword] = useState("ChangeMe123");
+  const [selectedUserId, setSelectedUserId] = useState("");
+  const [projectRoleDraft, setProjectRoleDraft] = useState("developer");
+  const directoryUsers = users?.users ?? [];
+  const memberships = users?.memberships ?? [];
+  const projectMemberships = users?.project_memberships ?? [];
+  const activeProjectMembers = useQuery({
+    queryKey: ["project-members", activeProject?.id],
+    queryFn: () => listProjectMembers(activeProject!.id),
+    enabled: Boolean(activeProject) && access.has("projects:read")
+  });
+  const projectMembers = activeProjectMembers.data ?? [];
+  const selectedUser = directoryUsers.find((user) => user.id === selectedUserId) ?? directoryUsers[0];
+  const selectedUserProjectMemberships = selectedUser ? projectMembershipsForUser(projectMemberships, selectedUser.id) : [];
+  const userPagination = useListPagination(directoryUsers);
+  const memberPagination = useListPagination(projectMembers);
+  const projectPagination = useListPagination(projects);
+  const accessPagination = useListPagination(selectedUserProjectMemberships);
+
+  const createUserMutation = useMutation({
+    mutationFn: () => createUser({ email, display_name: displayName, role: orgRole, password: password.trim() || undefined }),
+    onSuccess: (created) => {
+      setSelectedUserId(created.user.id);
+      setPassword("");
+      void queryClient.invalidateQueries({ queryKey: ["users"] });
+      void queryClient.invalidateQueries({ queryKey: ["auth"] });
+      void queryClient.invalidateQueries({ queryKey: ["audit-logs"] });
+    }
+  });
+  const projectMemberMutation = useMutation({
+    mutationFn: () => upsertProjectMember(activeProject!.id, { user_id: selectedUser!.id, role: projectRoleDraft }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["project-members", activeProject?.id] });
+      void queryClient.invalidateQueries({ queryKey: ["users"] });
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      void queryClient.invalidateQueries({ queryKey: ["auth"] });
+      void queryClient.invalidateQueries({ queryKey: ["audit-logs"] });
+    }
+  });
+
+  useEffect(() => {
+    if (!selectedUserId && directoryUsers[0]) {
+      setSelectedUserId(directoryUsers[0].id);
+    }
+  }, [directoryUsers, selectedUserId]);
+
+  return (
+    <section className="admin-grid">
+      <div className="admin-main">
+        <div className="panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">{t("admin.identity")}</p>
+              <h3>{t("admin.users")}</h3>
+            </div>
+            <div className="panel-heading-actions">
+              <span>{t("common.total", { count: directoryUsers.length })}</span>
+              <ListPaginationControl pagination={userPagination} />
+            </div>
+          </div>
+          {!access.has("users:write") ? <AccessNotice permission="users:write" /> : null}
+          <form className="form-grid bordered admin-user-form" onSubmit={(event) => submit(event, () => createUserMutation.mutate())}>
+            <label>
+              {t("admin.email")}
+              <input value={email} onChange={(event) => setEmail(event.target.value)} />
+            </label>
+            <label>
+              {t("admin.displayName")}
+              <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} />
+            </label>
+            <label>
+              {t("admin.orgRole")}
+              <select className="title-select" value={orgRole} onChange={(event) => setOrgRole(event.target.value)}>
+                {orgRoles.map((role) => (
+                  <option key={role} value={role}>
+                    {roleLabel(role, t)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              {t("admin.password")}
+              <input
+                autoComplete="new-password"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder={t("admin.passwordPlaceholder")}
+              />
+            </label>
+            <button className="primary-button" type="submit" disabled={createUserMutation.isPending || !access.has("users:write")}>
+              {t("admin.saveUser")}
+            </button>
+          </form>
+          <div className="table-list admin-user-list bounded-list">
+            {directoryUsers.length ? (
+              userPagination.items.map((user) => {
+                const role = orgRoleForUser(memberships, user.id);
+                const projectCount = projectMemberships.filter((membership) => membership.user_id === user.id).length;
+                return (
+                  <button
+                    className={`data-row selectable-row admin-user-row ${user.id === selectedUser?.id ? "is-selected" : ""}`}
+                    key={user.id}
+                    onClick={() => setSelectedUserId(user.id)}
+                    type="button"
+                  >
+                    <div>
+                      <strong>{user.display_name || user.email}</strong>
+                      <code>{user.email}</code>
+                    </div>
+                    <StatusBadge status={role || "viewer"} />
+                    <span>{t("admin.projectCount", { count: projectCount })}</span>
+                    <code>{user.external_provider || t("admin.localUser")}</code>
+                  </button>
+                );
+              })
+            ) : (
+              <div className="empty-state">{t("admin.noUsers")}</div>
+            )}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">{t("admin.activeProject")}</p>
+              <h3>{activeProject?.name ?? t("admin.noProject")}</h3>
+            </div>
+            <div className="panel-heading-actions">
+              <span>{t("common.total", { count: projectMembers.length })}</span>
+              <ListPaginationControl pagination={memberPagination} />
+            </div>
+          </div>
+          {!access.has("projects:write") ? <AccessNotice permission="projects:write" /> : null}
+          <form className="form-grid bordered admin-member-form" onSubmit={(event) => submit(event, () => projectMemberMutation.mutate())}>
+            <label>
+              {t("admin.user")}
+              <select className="title-select" value={selectedUser?.id ?? ""} onChange={(event) => setSelectedUserId(event.target.value)}>
+                {directoryUsers.map((user) => (
+                  <option key={user.id} value={user.id}>
+                    {user.display_name || user.email}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              {t("admin.projectRole")}
+              <select className="title-select" value={projectRoleDraft} onChange={(event) => setProjectRoleDraft(event.target.value)}>
+                {projectRoles.map((role) => (
+                  <option key={role} value={role}>
+                    {roleLabel(role, t)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <button
+              className="primary-button"
+              type="submit"
+              disabled={!activeProject || !selectedUser || projectMemberMutation.isPending || !access.has("projects:write")}
+            >
+              {t("admin.addMember")}
+            </button>
+          </form>
+          <div className="table-list admin-member-list bounded-list">
+            {projectMembers.length ? (
+              memberPagination.items.map((membership) => (
+                <div className="data-row admin-member-row" key={`${membership.project_id}:${membership.user_id}`}>
+                  <div>
+                    <strong>{membership.user_name || membership.user_email || membership.user_id}</strong>
+                    <code>{membership.user_email || membership.user_id}</code>
+                  </div>
+                  <StatusBadge status={membership.role} />
+                  <span>{membership.project_name || activeProject?.name || membership.project_id}</span>
+                  <code>{new Date(membership.created_at).toLocaleDateString()}</code>
+                </div>
+              ))
+            ) : (
+              <div className="empty-state">{activeProject ? t("admin.noMembers") : t("admin.noProjectMembers")}</div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <aside className="admin-side">
+        <div className="panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">{t("admin.scope")}</p>
+              <h3>{t("admin.projects")}</h3>
+            </div>
+            <div className="panel-heading-actions">
+              <span>{t("common.total", { count: projects.length })}</span>
+              <ListPaginationControl pagination={projectPagination} />
+            </div>
+          </div>
+          <div className="project-access-list bounded-list compact-bounded-list">
+            {projects.length ? (
+              projectPagination.items.map((project) => {
+                const count = projectMemberships.filter((membership) => membership.project_id === project.id).length;
+                return (
+                  <button
+                    className={`project-access-row ${project.id === activeProject?.id ? "is-selected" : ""}`}
+                    key={project.id}
+                    onClick={() => onSelectProject(project.id)}
+                    type="button"
+                  >
+                    <span>
+                      <strong>{project.name}</strong>
+                      <code>{project.slug}</code>
+                    </span>
+                    <em>{t("admin.projectMembers", { count })}</em>
+                  </button>
+                );
+              })
+            ) : (
+              <div className="empty-state compact">{t("admin.noProjects")}</div>
+            )}
+          </div>
+        </div>
+
+        <div className="panel">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">{t("admin.selectedUser")}</p>
+              <h3>{selectedUser?.display_name || selectedUser?.email || t("admin.noUser")}</h3>
+            </div>
+            <div className="panel-heading-actions">
+              <span>{t("common.total", { count: selectedUserProjectMemberships.length })}</span>
+              <ListPaginationControl pagination={accessPagination} />
+            </div>
+          </div>
+          {selectedUser ? (
+            <div className="user-access-card">
+              <dl className="detail-list">
+                <div>
+                  <dt>{t("admin.orgRole")}</dt>
+                  <dd>{roleLabel(orgRoleForUser(memberships, selectedUser.id), t)}</dd>
+                </div>
+                <div>
+                  <dt>{t("admin.createdAt")}</dt>
+                  <dd>{formatDate(selectedUser.created_at, t)}</dd>
+                </div>
+              </dl>
+              <div className="permission-stack user-project-stack bounded-list compact-bounded-list">
+                {selectedUserProjectMemberships.length ? (
+                  accessPagination.items.map((membership) => (
+                    <code key={`${membership.project_id}:${membership.user_id}`}>
+                      {membership.project_name || membership.project_slug || membership.project_id}: {roleLabel(membership.role, t)}
+                    </code>
+                  ))
+                ) : (
+                  <code>{t("admin.noProjectAccess")}</code>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="empty-state">{t("admin.noUser")}</div>
+          )}
+        </div>
+      </aside>
+    </section>
+  );
+}
+
+const orgRoles = ["owner", "admin", "tech_lead", "operator", "reviewer", "auditor", "viewer"];
+const projectRoles = ["owner", "project_admin", "maintainer", "developer", "reviewer", "auditor", "viewer"];
+
+function orgRoleForUser(memberships: UserDirectory["memberships"], userId: string) {
+  return memberships.find((membership) => membership.user_id === userId)?.role ?? "viewer";
+}
+
+function projectMembershipsForUser(memberships: ProjectMembership[], userId: string) {
+  return memberships
+    .filter((membership) => membership.user_id === userId)
+    .sort((first, second) => (first.project_name || first.project_id).localeCompare(second.project_name || second.project_id));
+}
+
+function roleLabel(role: string, t?: (key: string) => string) {
+  const normalized = role.toLowerCase().replaceAll("_", "-");
+  if (t) {
+    const translated = t(`status.${normalized}`);
+    if (translated !== `status.${normalized}`) {
+      return translated;
+    }
+  }
+  return labelize(role);
 }
 
 function ApprovalsView() {
   const { t } = useI18n();
   const access = useAccess();
   const approvals = useQuery({ queryKey: ["approvals"], queryFn: listApprovals, enabled: access.has("projects:read"), refetchInterval: pollWhileHealthy(3_000) });
+  const approvalList = approvals.data ?? [];
+  const pagination = useListPagination(approvalList);
   const mutation = useMutation({
     mutationFn: ({ approval, status }: { approval: Approval; status: "approved" | "rejected" }) =>
       decideApproval(approval.id, status, status === "approved" ? "Approved in Web Console." : "Rejected in Web Console."),
@@ -1930,11 +2627,14 @@ function ApprovalsView() {
     <section className="panel">
       <div className="panel-heading">
         <h3>{t("approvals.center")}</h3>
-        <span>{t("common.requests", { count: approvals.data?.length ?? 0 })}</span>
+        <div className="panel-heading-actions">
+          <span>{t("common.requests", { count: approvalList.length })}</span>
+          <ListPaginationControl pagination={pagination} />
+        </div>
       </div>
-      <div className="table-list">
+      <div className="table-list bounded-list">
         {approvals.data?.length ? (
-          approvals.data.map((approval) => (
+          pagination.items.map((approval) => (
             <div className="data-row" key={approval.id}>
               <div>
                 <strong>{approval.approval_type}</strong>
@@ -1964,6 +2664,8 @@ function NodesView() {
   const { t } = useI18n();
   const access = useAccess();
   const nodes = useQuery({ queryKey: ["executor-nodes"], queryFn: listExecutorNodes, enabled: access.has("nodes:read") });
+  const nodeList = nodes.data ?? [];
+  const pagination = useListPagination(nodeList);
   const [name, setName] = useState("ssh-worker-1");
   const [address, setAddress] = useState("codex-worker@example.invalid:22");
   const [agentDURL, setAgentDURL] = useState("http://worker-agentd-dev:7070");
@@ -1991,7 +2693,10 @@ function NodesView() {
     <section className="panel">
       <div className="panel-heading">
         <h3>{t("nodes.executorNodes")}</h3>
-        <span>{t("common.available", { count: nodes.data?.length ?? 0 })}</span>
+        <div className="panel-heading-actions">
+          <span>{t("common.available", { count: nodeList.length })}</span>
+          <ListPaginationControl pagination={pagination} />
+        </div>
       </div>
       {!access.has("nodes:write") ? <AccessNotice permission="nodes:write" /> : null}
       <form className="form-grid bordered inline-form node-form" onSubmit={(event) => submit(event, () => mutation.mutate())}>
@@ -2019,8 +2724,8 @@ function NodesView() {
           {t("nodes.register")}
         </button>
       </form>
-      <div className="table-list">
-        {nodes.data?.map((node) => (
+      <div className="table-list bounded-list">
+        {pagination.items.map((node) => (
           <div className="data-row" key={node.id}>
             <div>
               <strong>{node.name}</strong>
@@ -2049,6 +2754,7 @@ function NodesView() {
 function OrganizationsView({ organizations }: { organizations: Organization[] }) {
   const { t } = useI18n();
   const access = useAccess();
+  const pagination = useListPagination(organizations);
   const [name, setName] = useState("Engineering");
   const [slug, setSlug] = useState("engineering");
   const mutation = useMutation({
@@ -2063,7 +2769,10 @@ function OrganizationsView({ organizations }: { organizations: Organization[] })
     <section className="panel">
       <div className="panel-heading">
         <h3>{t("organizations.organizations")}</h3>
-        <span>{t("common.provisioned", { count: organizations.length })}</span>
+        <div className="panel-heading-actions">
+          <span>{t("common.provisioned", { count: organizations.length })}</span>
+          <ListPaginationControl pagination={pagination} />
+        </div>
       </div>
       {!access.has("organizations:write") ? <AccessNotice permission="organizations:write" /> : null}
       <form className="form-grid bordered inline-form" onSubmit={(event) => submit(event, () => mutation.mutate())}>
@@ -2079,9 +2788,9 @@ function OrganizationsView({ organizations }: { organizations: Organization[] })
           {t("organizations.provision")}
         </button>
       </form>
-      <div className="table-list">
+      <div className="table-list bounded-list">
         {organizations.length ? (
-          organizations.map((org) => (
+          pagination.items.map((org) => (
             <div className="data-row" key={org.id}>
               <div>
                 <strong>{org.name}</strong>
@@ -2105,23 +2814,33 @@ function AuditView() {
   const access = useAccess();
   const auditLogs = useQuery({ queryKey: ["audit-logs"], queryFn: listAuditLogs, enabled: access.has("audit:read"), refetchInterval: pollWhileHealthy(5_000) });
   const toolCalls = useQuery({ queryKey: ["tool-calls"], queryFn: listToolCalls, enabled: access.has("audit:read"), refetchInterval: pollWhileHealthy(5_000) });
+  const auditList = auditLogs.data ?? [];
+  const toolCallList = toolCalls.data ?? [];
+  const auditPagination = useListPagination(auditList);
+  const toolPagination = useListPagination(toolCallList);
 
   return (
-    <section className="content-grid">
+    <section className="content-grid audit-layout">
       <div className="panel">
         <div className="panel-heading">
           <h3>{t("audit.logs")}</h3>
-          <span>{t("common.recent", { count: auditLogs.data?.length ?? 0 })}</span>
+          <div className="panel-heading-actions">
+            <span>{t("common.recent", { count: auditList.length })}</span>
+            <ListPaginationControl pagination={auditPagination} />
+          </div>
         </div>
-        <CompactAuditList entries={auditLogs.data ?? []} limit={20} />
+        <CompactAuditList entries={auditPagination.items} className="bounded-list" />
       </div>
       <div className="panel">
         <div className="panel-heading">
           <h3>{t("dashboard.toolCalls")}</h3>
-          <span>{t("common.recent", { count: toolCalls.data?.length ?? 0 })}</span>
+          <div className="panel-heading-actions">
+            <span>{t("common.recent", { count: toolCallList.length })}</span>
+            <ListPaginationControl pagination={toolPagination} />
+          </div>
         </div>
-        <div className="table-list">
-          {toolCalls.data?.map((call) => (
+        <div className="table-list bounded-list">
+          {toolPagination.items.map((call) => (
             <div className="data-row" key={call.id}>
               <div>
                 <strong>{call.tool_name}</strong>
@@ -2139,17 +2858,17 @@ function AuditView() {
 }
 
 function CompactAuditList({
-  entries,
-  limit = 8
+  className,
+  entries
 }: {
+  className?: string;
   entries: Array<{ id: string; action: string; resource_type: string; resource_id: string; entry_hash?: string; prev_hash?: string }>;
-  limit?: number;
 }) {
   const { t } = useI18n();
   return (
-    <div className="audit-list">
+    <div className={`audit-list ${className ?? ""}`}>
       {entries.length ? (
-        entries.slice(0, limit).map((entry) => (
+        entries.map((entry) => (
           <div className="audit-row" key={entry.id}>
             <span>{entry.action}</span>
             <div>
@@ -2219,7 +2938,13 @@ function mergeRunEvents(first: RunEvent[], second: RunEvent[]) {
   return Array.from(byID.values()).sort((a, b) => a.seq - b.seq);
 }
 
-function EventList({ events, streamState }: { events: RunEvent[]; streamState?: EventStreamState }) {
+function EventList({
+  events,
+  streamState
+}: {
+  events: RunEvent[];
+  streamState?: EventStreamState;
+}) {
   const { t } = useI18n();
   const stateLabel = streamState === "live" ? t("runs.live") : streamState === "connecting" ? t("runs.connecting") : streamState === "fallback" ? t("runs.polling") : "";
   return (
@@ -2247,13 +2972,19 @@ function labelize(value: string) {
     .replace(/\b\w/g, (match) => match.toUpperCase());
 }
 
+function workflowActionLabel(action: string, t: (key: string) => string) {
+  const key = `workflowAction.${action}`;
+  const translated = t(key);
+  return translated === key ? labelize(action) : translated;
+}
+
 function pollWhileHealthy(interval: number) {
   return (query: { state: { error: unknown } }) => (query.state.error ? false : interval);
 }
 
-function formatDate(value?: string) {
+function formatDate(value: string | undefined, t: (key: string) => string) {
   if (!value) {
-    return "not recorded";
+    return t("common.notRecorded");
   }
   return new Date(value).toLocaleString();
 }

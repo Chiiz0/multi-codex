@@ -55,6 +55,8 @@ type Config struct {
 	AuthSessionTTL                   time.Duration
 	AuthCookieSecure                 bool
 	AuthLoginStateTTL                time.Duration
+	LocalAdminEmail                  string
+	LocalAdminPassword               string
 	OIDCIssuer                       string
 	OIDCAudience                     string
 	OIDCJWKSURL                      string
@@ -145,6 +147,8 @@ func FromEnv() Config {
 		AuthSessionTTL:                   envDuration("MULTICODEX_AUTH_SESSION_TTL", 12*time.Hour),
 		AuthCookieSecure:                 envBool("MULTICODEX_AUTH_COOKIE_SECURE", false),
 		AuthLoginStateTTL:                envDuration("MULTICODEX_AUTH_LOGIN_STATE_TTL", 10*time.Minute),
+		LocalAdminEmail:                  env("MULTICODEX_LOCAL_ADMIN_EMAIL", "local-dev@multi-codex.invalid"),
+		LocalAdminPassword:               env("MULTICODEX_LOCAL_ADMIN_PASSWORD", "admin123"),
 		OIDCIssuer:                       env("MULTICODEX_OIDC_ISSUER", ""),
 		OIDCAudience:                     env("MULTICODEX_OIDC_AUDIENCE", ""),
 		OIDCJWKSURL:                      env("MULTICODEX_OIDC_JWKS_URL", ""),

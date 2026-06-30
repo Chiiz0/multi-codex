@@ -315,6 +315,7 @@ func assertPilotAuditEvidence(t *testing.T, st *store.MemoryStore, dryRunID stri
 
 func apiDo(t *testing.T, handler http.Handler, method string, path string, body any, wantStatus int, out any) {
 	t.Helper()
+	cookie := localSessionCookie(t, handler)
 	var reader io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
@@ -324,6 +325,9 @@ func apiDo(t *testing.T, handler http.Handler, method string, path string, body 
 		reader = bytes.NewReader(data)
 	}
 	req := httptest.NewRequest(method, path, reader)
+	if cookie != nil {
+		req.AddCookie(cookie)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -337,6 +341,24 @@ func apiDo(t *testing.T, handler http.Handler, method string, path string, body 
 			t.Fatalf("decode %s %s: %v; body = %s", method, path, err, resp.Body.String())
 		}
 	}
+}
+
+func localSessionCookie(t *testing.T, handler http.Handler) *http.Cookie {
+	t.Helper()
+	body := bytes.NewReader([]byte(`{"email":"local-dev@multi-codex.invalid","password":"admin123"}`))
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/session", body)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		return nil
+	}
+	for _, cookie := range resp.Result().Cookies() {
+		if cookie.Name == authSessionCookieName {
+			return cookie
+		}
+	}
+	return nil
 }
 
 func createPilotMirror(t *testing.T) string {

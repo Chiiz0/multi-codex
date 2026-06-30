@@ -100,6 +100,8 @@ func (s *Server) routeAPI(w http.ResponseWriter, r *http.Request) {
 		s.authLogout(w, r)
 	case len(parts) == 3 && parts[0] == "auth" && parts[1] == "backchannel" && parts[2] == "logout":
 		s.authBackchannelLogout(w, r)
+	case len(parts) == 1 && parts[0] == "users":
+		s.users(w, r)
 	case len(parts) == 1 && parts[0] == "organizations":
 		s.organizations(w, r)
 	case len(parts) == 1 && parts[0] == "projects":
@@ -110,6 +112,8 @@ func (s *Server) routeAPI(w http.ResponseWriter, r *http.Request) {
 		s.queueDispatch(w, r)
 	case len(parts) == 2 && parts[0] == "projects":
 		s.project(w, r, parts[1])
+	case len(parts) == 3 && parts[0] == "projects" && parts[2] == "members":
+		s.projectMembers(w, r, parts[1])
 	case len(parts) == 3 && parts[0] == "projects" && parts[2] == "repositories":
 		s.repositories(w, r, parts[1])
 	case len(parts) == 3 && parts[0] == "projects" && parts[2] == "agent-profiles":
@@ -592,6 +596,7 @@ func (s *Server) authCapabilities(w http.ResponseWriter, r *http.Request) {
 		"oidc_configured":     oidcConfigured,
 		"session_ttl_seconds": int64(s.cfg.AuthSessionTTL.Seconds()),
 		"default_role":        s.cfg.OIDCDefaultRole,
+		"local_admin_email":   localAdminEmail(s.cfg.LocalAdminEmail),
 	})
 }
 
@@ -769,7 +774,30 @@ func (s *Server) authSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !strings.EqualFold(s.cfg.AuthMode, "oidc") {
-		auth := s.store.GetAuthContext()
+		var req struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		auth, passwordHash, err := s.store.GetUserByEmail(strings.TrimSpace(req.Email))
+		if err != nil || !authn.VerifyPassword(passwordHash, req.Password) {
+			s.audit("anonymous", "anonymous", "api.auth_denied", "auth_session", "local", map[string]any{
+				"method":   r.Method,
+				"path":     r.URL.Path,
+				"mode":     s.cfg.AuthMode,
+				"email":    strings.TrimSpace(req.Email),
+				"error":    "invalid local credentials",
+				"trace_id": observability.TraceID(r.Context()),
+			})
+			writeError(w, http.StatusUnauthorized, "email or password is incorrect")
+			return
+		}
+		if _, err := s.createAuthSession(w, r, auth, "local", auth.User.ID, "local"); err != nil {
+			writeError(w, http.StatusInternalServerError, "session persistence failed")
+			return
+		}
 		writeJSON(w, http.StatusOK, auth)
 		return
 	}
@@ -953,6 +981,82 @@ func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "logged_out", "mode": s.cfg.AuthMode})
 }
 
+func (s *Server) users(w http.ResponseWriter, r *http.Request) {
+	auth, err := s.requestAuth(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		users := s.store.ListUsers(auth.Membership.OrgID)
+		memberships := s.store.ListMemberships(auth.Membership.OrgID)
+		projectMemberships := []domain.ProjectMembership{}
+		for _, user := range users {
+			projectMemberships = append(projectMemberships, s.store.ListProjectMembershipsForUser(user.ID)...)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"users":               users,
+			"memberships":         memberships,
+			"project_memberships": projectMemberships,
+		})
+	case http.MethodPost:
+		var req struct {
+			Email            string `json:"email"`
+			DisplayName      string `json:"display_name"`
+			Role             string `json:"role"`
+			Password         string `json:"password"`
+			ExternalProvider string `json:"external_provider"`
+			ExternalSubject  string `json:"external_subject"`
+		}
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.Email == "" {
+			writeError(w, http.StatusBadRequest, "email is required")
+			return
+		}
+		created, err := s.store.UpsertUser(domain.User{
+			Email:            req.Email,
+			DisplayName:      req.DisplayName,
+			ExternalProvider: req.ExternalProvider,
+			ExternalSubject:  req.ExternalSubject,
+		}, auth.Membership.OrgID, req.Role)
+		if err != nil {
+			if errors.Is(err, store.ErrInvalidID) {
+				writeError(w, http.StatusBadRequest, "org_id must be a UUID")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		passwordUpdated := strings.TrimSpace(req.Password) != ""
+		if passwordUpdated {
+			passwordHash, err := authn.HashPassword(req.Password)
+			if err != nil {
+				if errors.Is(err, authn.ErrPasswordTooShort) {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "password hashing failed")
+				return
+			}
+			if err := s.store.SetUserPassword(created.User.ID, passwordHash); err != nil {
+				if errors.Is(err, store.ErrInvalidID) || errors.Is(err, store.ErrNotFound) {
+					writeError(w, http.StatusBadRequest, "user_id is invalid")
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "password update failed")
+				return
+			}
+		}
+		s.auditHuman(r, "api.user_upsert", "user", created.User.ID, map[string]any{"email": created.User.Email, "role": created.Membership.Role, "password_updated": passwordUpdated})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		methodNotAllowed(w)
+	}
+}
+
 func (s *Server) organizations(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -1003,6 +1107,10 @@ func (s *Server) projects(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusUnauthorized, "authentication required")
 			return
 		}
+		if !canAdminOrg(auth, auth.Membership.OrgID) {
+			s.denyResource(w, r, auth, "api.project_create", "organization", auth.Membership.OrgID, auth.Membership.OrgID)
+			return
+		}
 		project := s.store.CreateProject(domain.Project{OrgID: auth.Membership.OrgID, Name: req.Name, Slug: req.Slug, Description: req.Description})
 		s.auditHuman(r, "api.project_create", "project", project.ID, map[string]any{"slug": project.Slug})
 		writeJSON(w, http.StatusCreated, project)
@@ -1021,6 +1129,45 @@ func (s *Server) project(w http.ResponseWriter, r *http.Request, projectID strin
 		return
 	}
 	writeJSON(w, http.StatusOK, project)
+}
+
+func (s *Server) projectMembers(w http.ResponseWriter, r *http.Request, projectID string) {
+	if _, ok := s.authorizeProject(w, r, projectID, "api.project_members_access"); !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, s.store.ListProjectMemberships(projectID))
+	case http.MethodPost:
+		var req struct {
+			UserID string `json:"user_id"`
+			Role   string `json:"role"`
+		}
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.UserID == "" {
+			writeError(w, http.StatusBadRequest, "user_id is required")
+			return
+		}
+		membership, err := s.store.UpsertProjectMembership(domain.ProjectMembership{
+			ProjectID: projectID,
+			UserID:    req.UserID,
+			Role:      req.Role,
+		})
+		if err != nil {
+			if errors.Is(err, store.ErrInvalidID) {
+				writeError(w, http.StatusBadRequest, "project_id and user_id must be UUIDs")
+				return
+			}
+			notFound(w, err)
+			return
+		}
+		s.auditHuman(r, "api.project_member_upsert", "project", projectID, map[string]any{"user_id": req.UserID, "role": membership.Role})
+		writeJSON(w, http.StatusCreated, membership)
+	default:
+		methodNotAllowed(w)
+	}
 }
 
 func (s *Server) repositories(w http.ResponseWriter, r *http.Request, projectID string) {
@@ -2029,8 +2176,14 @@ func requiredPermission(method string, path string) string {
 		return ""
 	}
 	if method == http.MethodGet {
+		if strings.Contains(path, "/users") {
+			return "users:read"
+		}
 		if strings.Contains(path, "/organizations") {
 			return "organizations:read"
+		}
+		if strings.Contains(path, "/members") {
+			return "projects:read"
 		}
 		if strings.Contains(path, "/audit-logs") || strings.Contains(path, "/tool-calls") {
 			return "audit:read"
@@ -2046,8 +2199,14 @@ func requiredPermission(method string, path string) string {
 		}
 		return "projects:read"
 	}
+	if strings.Contains(path, "/users") {
+		return "users:write"
+	}
 	if strings.Contains(path, "/organizations") {
 		return "organizations:write"
+	}
+	if strings.Contains(path, "/members") {
+		return "projects:write"
 	}
 	if strings.Contains(path, "/executor-nodes") {
 		return "nodes:write"
@@ -2096,6 +2255,25 @@ func canAccessOrg(auth domain.AuthContext, orgID string) bool {
 	return orgID == "" || auth.Membership.OrgID == "" || auth.Membership.OrgID == orgID
 }
 
+func canAdminOrg(auth domain.AuthContext, orgID string) bool {
+	return canAccessOrg(auth, orgID) && hasPermission(auth.Permissions, "*")
+}
+
+func canAccessProject(auth domain.AuthContext, project domain.Project) bool {
+	if canAdminOrg(auth, project.OrgID) {
+		return true
+	}
+	if !canAccessOrg(auth, project.OrgID) {
+		return false
+	}
+	for _, membership := range auth.ProjectMemberships {
+		if membership.ProjectID == project.ID {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) denyResource(w http.ResponseWriter, r *http.Request, auth domain.AuthContext, action string, resourceType string, resourceID string, resourceOrgID string) {
 	actorID := auth.User.ID
 	if actorID == "" {
@@ -2121,7 +2299,7 @@ func (s *Server) authorizeProject(w http.ResponseWriter, r *http.Request, projec
 		writeError(w, http.StatusUnauthorized, "authentication required")
 		return domain.Project{}, false
 	}
-	if !canAccessOrg(auth, project.OrgID) {
+	if !canAccessProject(auth, project) {
 		s.denyResource(w, r, auth, action, "project", project.ID, project.OrgID)
 		return domain.Project{}, false
 	}
@@ -2227,7 +2405,7 @@ func (s *Server) filterProjectsForAuth(r *http.Request, projects []domain.Projec
 	}
 	filtered := []domain.Project{}
 	for _, project := range projects {
-		if canAccessOrg(auth, project.OrgID) {
+		if canAccessProject(auth, project) {
 			filtered = append(filtered, project)
 		}
 	}
@@ -2274,7 +2452,7 @@ func (s *Server) filterRunsForAuth(r *http.Request, runs []domain.Run) []domain.
 			continue
 		}
 		auth, err := s.requestAuth(r)
-		if err != nil || !canAccessOrg(auth, project.OrgID) {
+		if err != nil || !canAccessProject(auth, project) {
 			continue
 		}
 		filtered = append(filtered, run)
@@ -2294,7 +2472,7 @@ func (s *Server) filterApprovalsForAuth(r *http.Request, approvals []domain.Appr
 			continue
 		}
 		auth, err := s.requestAuth(r)
-		if err != nil || !canAccessOrg(auth, project.OrgID) {
+		if err != nil || !canAccessProject(auth, project) {
 			continue
 		}
 		filtered = append(filtered, approval)
@@ -2317,17 +2495,17 @@ func (s *Server) filterAuditLogsForAuth(r *http.Request, logs []domain.AuditLog)
 }
 
 func (s *Server) authContext(r *http.Request) (domain.AuthContext, error) {
-	if !strings.EqualFold(s.cfg.AuthMode, "oidc") {
-		return s.store.GetAuthContext(), nil
-	}
-	if s.oidc == nil {
-		return domain.AuthContext{}, fmt.Errorf("OIDC verifier is not configured")
-	}
 	if cookie, err := r.Cookie(authSessionCookieName); err == nil && strings.TrimSpace(cookie.Value) != "" {
 		auth, _, err := s.store.GetAuthSession(authn.TokenHash(cookie.Value), time.Now().UTC())
 		if err == nil {
 			return auth, nil
 		}
+	}
+	if !strings.EqualFold(s.cfg.AuthMode, "oidc") {
+		return domain.AuthContext{}, authn.ErrMissingBearer
+	}
+	if s.oidc == nil {
+		return domain.AuthContext{}, fmt.Errorf("OIDC verifier is not configured")
 	}
 	token, ok := authn.BearerToken(r.Header.Get("Authorization"))
 	if !ok {
@@ -2374,28 +2552,44 @@ func (s *Server) authContextFromClaims(r *http.Request, claims authn.Claims) (do
 }
 
 func (s *Server) createOIDCSession(w http.ResponseWriter, r *http.Request, auth domain.AuthContext, claims authn.Claims, source string) (domain.AuthSession, error) {
-	sessionToken, err := newOpaqueToken()
-	if err != nil {
-		return domain.AuthSession{}, err
-	}
 	expiresAt := time.Now().UTC().Add(s.cfg.AuthSessionTTL)
 	if !claims.ExpiresAt.IsZero() && claims.ExpiresAt.Before(expiresAt) {
 		expiresAt = claims.ExpiresAt
 	}
-	session, err := s.store.CreateAuthSessionWithExternalID(authn.TokenHash(sessionToken), auth, "oidc", claims.Subject, claims.SessionID, expiresAt)
+	session, err := s.createAuthSessionWithExternalID(w, r, auth, "oidc", claims.Subject, claims.SessionID, expiresAt, map[string]any{
+		"subject":                     claims.Subject,
+		"issuer":                      claims.Issuer,
+		"source":                      source,
+		"external_session_id_present": claims.SessionID != "",
+	})
+	return session, err
+}
+
+func (s *Server) createAuthSession(w http.ResponseWriter, r *http.Request, auth domain.AuthContext, provider string, subject string, source string) (domain.AuthSession, error) {
+	return s.createAuthSessionWithExternalID(w, r, auth, provider, subject, "", time.Now().UTC().Add(s.cfg.AuthSessionTTL), map[string]any{
+		"subject": subject,
+		"source":  source,
+	})
+}
+
+func (s *Server) createAuthSessionWithExternalID(w http.ResponseWriter, r *http.Request, auth domain.AuthContext, provider string, subject string, externalSessionID string, expiresAt time.Time, payload map[string]any) (domain.AuthSession, error) {
+	sessionToken, err := newOpaqueToken()
+	if err != nil {
+		return domain.AuthSession{}, err
+	}
+	session, err := s.store.CreateAuthSessionWithExternalID(authn.TokenHash(sessionToken), auth, provider, subject, externalSessionID, expiresAt)
 	if err != nil {
 		return domain.AuthSession{}, err
 	}
 	http.SetCookie(w, s.authSessionCookie(sessionToken, expiresAt))
-	s.audit("human", auth.User.ID, "api.auth_session_create", "auth_session", session.ID, map[string]any{
-		"subject":                     claims.Subject,
-		"issuer":                      claims.Issuer,
-		"source":                      source,
-		"expires_at":                  expiresAt.Format(time.RFC3339Nano),
-		"session_hash_prefix":         hashPrefix(session.TokenHash),
-		"external_session_id_present": claims.SessionID != "",
-		"trace_id":                    observability.TraceID(r.Context()),
-	})
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["provider"] = provider
+	payload["expires_at"] = expiresAt.Format(time.RFC3339Nano)
+	payload["session_hash_prefix"] = hashPrefix(session.TokenHash)
+	payload["trace_id"] = observability.TraceID(r.Context())
+	s.audit("human", auth.User.ID, "api.auth_session_create", "auth_session", session.ID, payload)
 	return session, nil
 }
 
@@ -2443,6 +2637,14 @@ func authEndpointDescriptor(rawURL string) map[string]any {
 		"host":   parsed.Host,
 		"path":   parsed.EscapedPath(),
 	}
+}
+
+func localAdminEmail(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "local-dev@multi-codex.invalid"
+	}
+	return value
 }
 
 func readLogoutToken(r *http.Request) (string, error) {

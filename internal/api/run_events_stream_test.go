@@ -43,8 +43,14 @@ func TestRunEventStreamSendsNewEventsAndAudits(t *testing.T) {
 	server := NewServer(config.Config{QueueEnabled: false}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	testServer := httptest.NewServer(server.Handler())
 	defer testServer.Close()
+	cookie := localSessionCookie(t, server.Handler())
 
-	resp, err := testServer.Client().Get(testServer.URL + "/api/v1/runs/" + run.ID + "/events/stream")
+	req, err := http.NewRequest(http.MethodGet, testServer.URL+"/api/v1/runs/"+run.ID+"/events/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(cookie)
+	resp, err := testServer.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

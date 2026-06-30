@@ -26,8 +26,10 @@ func TestQueueAPIDispatchStartsQueuedRunAndAudits(t *testing.T) {
 		WorktreeRoot:  t.TempDir(),
 		RepoCacheRoot: t.TempDir(),
 	}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cookie := localSessionCookie(t, server.Handler())
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/queue", nil)
+	req.AddCookie(cookie)
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -44,6 +46,7 @@ func TestQueueAPIDispatchStartsQueuedRunAndAudits(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/queue/dispatch", nil)
+	req.AddCookie(cookie)
 	resp = httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
 	if resp.Code != http.StatusAccepted {

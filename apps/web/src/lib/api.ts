@@ -6,6 +6,7 @@ const recordSchema = z.record(z.string(), z.unknown());
 
 const projectSchema = z.object({
   id: z.string(),
+  org_id: z.string().optional(),
   name: z.string(),
   slug: z.string(),
   description: z.string(),
@@ -16,6 +17,33 @@ const organizationSchema = z.object({
   id: z.string(),
   name: z.string(),
   slug: z.string(),
+  created_at: z.string()
+});
+
+const userSchema = z.object({
+  id: z.string(),
+  email: z.string(),
+  display_name: z.string(),
+  external_provider: z.string().optional(),
+  external_subject: z.string().optional(),
+  created_at: z.string()
+});
+
+const membershipSchema = z.object({
+  org_id: z.string(),
+  user_id: z.string(),
+  role: z.string(),
+  created_at: z.string()
+});
+
+const projectMembershipSchema = z.object({
+  project_id: z.string(),
+  user_id: z.string(),
+  role: z.string(),
+  project_name: z.string().optional(),
+  project_slug: z.string().optional(),
+  user_email: z.string().optional(),
+  user_name: z.string().optional(),
   created_at: z.string()
 });
 
@@ -229,30 +257,32 @@ const queueSnapshotSchema = z.object({
 });
 
 const authContextSchema = z.object({
-  user: z.object({
-    id: z.string(),
-    email: z.string(),
-    display_name: z.string(),
-    created_at: z.string()
-  }),
-  membership: z.object({
-    org_id: z.string(),
-    user_id: z.string(),
-    role: z.string(),
-    created_at: z.string()
-  }),
+  user: userSchema,
+  membership: membershipSchema,
+  project_memberships: z.array(projectMembershipSchema).default([]),
   permissions: z.array(z.string())
+});
+
+const userDirectorySchema = z.object({
+  users: z.array(userSchema),
+  memberships: z.array(membershipSchema),
+  project_memberships: z.array(projectMembershipSchema)
 });
 
 const authCapabilitiesSchema = z.object({
   auth_mode: z.string(),
   oidc_configured: z.boolean(),
   session_ttl_seconds: z.number(),
-  default_role: z.string()
+  default_role: z.string(),
+  local_admin_email: z.string().optional()
 });
 
 export type Project = z.infer<typeof projectSchema>;
 export type Organization = z.infer<typeof organizationSchema>;
+export type User = z.infer<typeof userSchema>;
+export type Membership = z.infer<typeof membershipSchema>;
+export type ProjectMembership = z.infer<typeof projectMembershipSchema>;
+export type UserDirectory = z.infer<typeof userDirectorySchema>;
 export type Repository = z.infer<typeof repositorySchema>;
 export type Task = z.infer<typeof taskSchema>;
 export type Run = z.infer<typeof runSchema>;
@@ -324,11 +354,22 @@ export function beginOIDCLogin() {
 }
 
 export async function createBrowserSession(token: string) {
+  const trimmed = token.trim();
   const response = await apiFetch("/api/v1/auth/session", {
     method: "POST",
     credentials: "include",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token.trim()}` },
+    headers: { "Content-Type": "application/json", ...(trimmed ? { Authorization: `Bearer ${trimmed}` } : {}) },
     body: "{}"
+  });
+  return parseResponse(response, authContextSchema);
+}
+
+export async function loginWithPassword(input: { email: string; password: string }) {
+  const response = await apiFetch("/api/v1/auth/session", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
   });
   return parseResponse(response, authContextSchema);
 }
@@ -369,6 +410,14 @@ export function listOrganizations() {
   return getJSON("/api/v1/organizations", z.array(organizationSchema));
 }
 
+export function listUsers() {
+  return getJSON("/api/v1/users", userDirectorySchema);
+}
+
+export function createUser(input: { email: string; display_name: string; role: string; password?: string; external_provider?: string; external_subject?: string }) {
+  return postJSON("/api/v1/users", input, authContextSchema);
+}
+
 export function createOrganization(input: { name: string; slug: string }) {
   return postJSON("/api/v1/organizations", input, organizationSchema);
 }
@@ -379,6 +428,14 @@ export function createProject(input: { name: string; slug: string; description: 
 
 export function listRepositories(projectId: string) {
   return getJSON(`/api/v1/projects/${projectId}/repositories`, z.array(repositorySchema));
+}
+
+export function listProjectMembers(projectId: string) {
+  return getJSON(`/api/v1/projects/${projectId}/members`, z.array(projectMembershipSchema));
+}
+
+export function upsertProjectMember(projectId: string, input: { user_id: string; role: string }) {
+  return postJSON(`/api/v1/projects/${projectId}/members`, input, projectMembershipSchema);
 }
 
 export function createRepository(projectId: string, input: { name: string; provider: string; remote_url: string; default_branch: string }) {

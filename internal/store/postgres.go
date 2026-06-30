@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
+	authn "github.com/Chiiz0/multi-codex/internal/auth"
 	"github.com/Chiiz0/multi-codex/internal/domain"
 )
 
@@ -26,6 +28,17 @@ func NewPostgresStore(db *sql.DB, log *slog.Logger, databaseURL ...string) *Post
 }
 
 func (s *PostgresStore) EnsureSeed(ctx context.Context) error {
+	return s.EnsureSeedWithCredentials(ctx, "", "")
+}
+
+func (s *PostgresStore) EnsureSeedWithCredentials(ctx context.Context, adminEmail string, adminPassword string) error {
+	adminEmail = strings.TrimSpace(adminEmail)
+	if adminEmail == "" {
+		adminEmail = "local-dev@multi-codex.invalid"
+	}
+	if adminPassword == "" {
+		adminPassword = "admin123"
+	}
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO organizations (id, name, slug)
 VALUES ($1::uuid, 'Default Organization', 'default')
@@ -34,8 +47,18 @@ ON CONFLICT (slug) DO NOTHING`, defaultOrgID); err != nil {
 	}
 	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO users (id, email, display_name)
-VALUES ($1::uuid, 'local-dev@multi-codex.invalid', 'Local Developer')
-ON CONFLICT (email) DO NOTHING`, defaultUserID); err != nil {
+VALUES ($1::uuid, $2, 'Local Developer')
+ON CONFLICT (email) DO NOTHING`, defaultUserID, adminEmail); err != nil {
+		return err
+	}
+	passwordHash, err := authn.HashPassword(adminPassword)
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO user_password_credentials (user_id, password_hash)
+VALUES ($1::uuid, $2)
+ON CONFLICT (user_id) DO NOTHING`, defaultUserID, passwordHash); err != nil {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `
@@ -50,11 +73,16 @@ VALUES ($2::uuid, $1::uuid, 'Demo Engineering', 'demo-engineering', 'Seed projec
 ON CONFLICT (org_id, slug) DO NOTHING`, defaultOrgID, defaultProjectID); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := s.db.ExecContext(ctx, `
+INSERT INTO project_memberships (project_id, user_id, role)
+VALUES ($1::uuid, $2::uuid, 'owner')
+ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role`, defaultProjectID, defaultUserID); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
 INSERT INTO repositories (id, project_id, name, provider, remote_url, default_branch)
 VALUES ($1::uuid, $2::uuid, 'demo-service', 'local', 'file:///workspace/demo-service.git', 'main')
-ON CONFLICT DO NOTHING`, defaultRepoID, defaultProjectID)
-	if err != nil {
+ON CONFLICT DO NOTHING`, defaultRepoID, defaultProjectID); err != nil {
 		return err
 	}
 

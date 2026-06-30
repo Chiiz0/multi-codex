@@ -25,6 +25,7 @@ func TestSkillVersionHistoryAPI(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/skills/"+latest.ID+"/versions", nil)
+	req.AddCookie(localSessionCookie(t, server.Handler()))
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -49,6 +50,7 @@ func TestSkillVersionHistoryAPI(t *testing.T) {
 func createSkillVersion(t *testing.T, server *Server, body string) domain.Skill {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/skills", bytes.NewBufferString(body))
+	req.AddCookie(localSessionCookie(t, server.Handler()))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)

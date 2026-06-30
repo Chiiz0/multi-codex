@@ -17,8 +17,10 @@ import (
 func TestOrganizationsAPIProvisioningAuditsCreate(t *testing.T) {
 	st := store.NewMemoryStore()
 	server := NewServer(config.Config{}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cookie := localSessionCookie(t, server.Handler())
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/organizations", strings.NewReader(`{"name":"Engineering","slug":"engineering"}`))
+	req.AddCookie(cookie)
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
@@ -34,6 +36,7 @@ func TestOrganizationsAPIProvisioningAuditsCreate(t *testing.T) {
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/api/v1/organizations", nil)
+	req.AddCookie(cookie)
 	resp = httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -62,8 +65,10 @@ func TestOrganizationsAPIProvisioningAuditsCreate(t *testing.T) {
 func TestOrganizationsAPIRejectsDuplicateSlug(t *testing.T) {
 	st := store.NewMemoryStore()
 	server := NewServer(config.Config{}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cookie := localSessionCookie(t, server.Handler())
 	for i := 0; i < 2; i++ {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/organizations", strings.NewReader(`{"name":"Engineering","slug":"engineering"}`))
+		req.AddCookie(cookie)
 		req.Header.Set("Content-Type", "application/json")
 		resp := httptest.NewRecorder()
 		server.Handler().ServeHTTP(resp, req)

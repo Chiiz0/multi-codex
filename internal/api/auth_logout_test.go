@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
@@ -18,7 +19,9 @@ import (
 func TestAuthLogoutAuditsDecision(t *testing.T) {
 	st := store.NewMemoryStore()
 	server := NewServer(config.Config{AuthMode: "local"}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cookie := localSessionCookie(t, server.Handler())
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/logout", nil)
+	req.AddCookie(cookie)
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
@@ -30,6 +33,46 @@ func TestAuthLogoutAuditsDecision(t *testing.T) {
 		}
 	}
 	t.Fatalf("expected api.auth_logout audit row")
+}
+
+func TestLocalAuthRequiresBrowserSession(t *testing.T) {
+	st := store.NewMemoryStore()
+	server := NewServer(config.Config{AuthMode: "local"}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
+	resp := httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous local auth status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/session", bytes.NewReader([]byte(`{"email":"local-dev@multi-codex.invalid","password":"wrong-password"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	resp = httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("bad password session status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/v1/auth/session", bytes.NewReader([]byte(`{"email":"local-dev@multi-codex.invalid","password":"admin123"}`)))
+	req.Header.Set("Content-Type", "application/json")
+	resp = httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("session status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	cookies := resp.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != authSessionCookieName || !cookies[0].HttpOnly {
+		t.Fatalf("session cookies = %#v", cookies)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/auth/me", nil)
+	req.AddCookie(cookies[0])
+	resp = httptest.NewRecorder()
+	server.Handler().ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("session local auth status = %d, body = %s", resp.Code, resp.Body.String())
+	}
 }
 
 func TestOIDCAuthLogoutRevokesBearerToken(t *testing.T) {

@@ -3,6 +3,8 @@ import type { AuthContext } from "./api";
 
 export type Permission =
   | "*"
+  | "users:read"
+  | "users:write"
   | "organizations:read"
   | "organizations:write"
   | "projects:read"
@@ -60,4 +62,11 @@ export function visiblePermissions(auth: AuthContext | undefined) {
     return ["*"];
   }
   return auth.permissions;
+}
+
+export function projectRole(auth: AuthContext | undefined, projectId?: string) {
+  if (!auth || !projectId) {
+    return "";
+  }
+  return auth.project_memberships.find((membership) => membership.project_id === projectId)?.role ?? "";
 }

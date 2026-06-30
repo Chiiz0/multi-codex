@@ -3,9 +3,11 @@ package store
 import (
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	authn "github.com/Chiiz0/multi-codex/internal/auth"
 	"github.com/Chiiz0/multi-codex/internal/domain"
 )
 
@@ -14,68 +16,86 @@ var ErrNoCapacity = errors.New("no executor capacity available")
 var ErrConflict = errors.New("resource already exists")
 
 type MemoryStore struct {
-	mu            sync.RWMutex
-	auth          domain.AuthContext
-	externalUsers map[string]domain.AuthContext
-	revokedTokens map[string]domain.AuthTokenRevocation
-	authSessions  map[string]domain.AuthSession
-	sessionAuth   map[string]domain.AuthContext
-	loginStates   map[string]domain.AuthLoginState
-	organizations map[string]domain.Organization
-	projects      map[string]domain.Project
-	repositories  map[string]domain.Repository
-	skills        map[string]domain.Skill
-	skillVersions map[string][]domain.SkillVersion
-	profiles      map[string]domain.AgentProfile
-	nodes         map[string]domain.ExecutorNode
-	tasks         map[string]domain.Task
-	runs          map[string]domain.Run
-	events        map[string][]domain.RunEvent
-	artifacts     map[string]domain.Artifact
-	scopeChecks   map[string][]domain.ScopeCheckRecord
-	approvals     map[string]domain.Approval
-	toolCalls     []domain.ToolCall
-	mcpSessions   map[string]domain.MCPSession
-	mcpEvents     map[string][]domain.MCPSessionEvent
-	auditLogs     []domain.AuditLog
-	nextEventID   int64
+	mu             sync.RWMutex
+	auth           domain.AuthContext
+	externalUsers  map[string]domain.AuthContext
+	revokedTokens  map[string]domain.AuthTokenRevocation
+	authSessions   map[string]domain.AuthSession
+	sessionAuth    map[string]domain.AuthContext
+	loginStates    map[string]domain.AuthLoginState
+	users          map[string]domain.User
+	passwords      map[string]string
+	memberships    map[string]domain.Membership
+	projectMembers map[string]domain.ProjectMembership
+	organizations  map[string]domain.Organization
+	projects       map[string]domain.Project
+	repositories   map[string]domain.Repository
+	skills         map[string]domain.Skill
+	skillVersions  map[string][]domain.SkillVersion
+	profiles       map[string]domain.AgentProfile
+	nodes          map[string]domain.ExecutorNode
+	tasks          map[string]domain.Task
+	runs           map[string]domain.Run
+	events         map[string][]domain.RunEvent
+	artifacts      map[string]domain.Artifact
+	scopeChecks    map[string][]domain.ScopeCheckRecord
+	approvals      map[string]domain.Approval
+	toolCalls      []domain.ToolCall
+	mcpSessions    map[string]domain.MCPSession
+	mcpEvents      map[string][]domain.MCPSessionEvent
+	auditLogs      []domain.AuditLog
+	nextEventID    int64
 }
 
 func NewMemoryStore() *MemoryStore {
+	return NewMemoryStoreWithSeed("", "")
+}
+
+func NewMemoryStoreWithSeed(adminEmail string, adminPassword string) *MemoryStore {
 	s := &MemoryStore{
-		projects:      map[string]domain.Project{},
-		externalUsers: map[string]domain.AuthContext{},
-		revokedTokens: map[string]domain.AuthTokenRevocation{},
-		authSessions:  map[string]domain.AuthSession{},
-		sessionAuth:   map[string]domain.AuthContext{},
-		loginStates:   map[string]domain.AuthLoginState{},
-		organizations: map[string]domain.Organization{},
-		repositories:  map[string]domain.Repository{},
-		skills:        map[string]domain.Skill{},
-		skillVersions: map[string][]domain.SkillVersion{},
-		profiles:      map[string]domain.AgentProfile{},
-		nodes:         map[string]domain.ExecutorNode{},
-		tasks:         map[string]domain.Task{},
-		runs:          map[string]domain.Run{},
-		events:        map[string][]domain.RunEvent{},
-		artifacts:     map[string]domain.Artifact{},
-		scopeChecks:   map[string][]domain.ScopeCheckRecord{},
-		approvals:     map[string]domain.Approval{},
-		toolCalls:     []domain.ToolCall{},
-		mcpSessions:   map[string]domain.MCPSession{},
-		mcpEvents:     map[string][]domain.MCPSessionEvent{},
-		auditLogs:     []domain.AuditLog{},
-		nextEventID:   1,
+		projects:       map[string]domain.Project{},
+		externalUsers:  map[string]domain.AuthContext{},
+		revokedTokens:  map[string]domain.AuthTokenRevocation{},
+		authSessions:   map[string]domain.AuthSession{},
+		sessionAuth:    map[string]domain.AuthContext{},
+		loginStates:    map[string]domain.AuthLoginState{},
+		users:          map[string]domain.User{},
+		passwords:      map[string]string{},
+		memberships:    map[string]domain.Membership{},
+		projectMembers: map[string]domain.ProjectMembership{},
+		organizations:  map[string]domain.Organization{},
+		repositories:   map[string]domain.Repository{},
+		skills:         map[string]domain.Skill{},
+		skillVersions:  map[string][]domain.SkillVersion{},
+		profiles:       map[string]domain.AgentProfile{},
+		nodes:          map[string]domain.ExecutorNode{},
+		tasks:          map[string]domain.Task{},
+		runs:           map[string]domain.Run{},
+		events:         map[string][]domain.RunEvent{},
+		artifacts:      map[string]domain.Artifact{},
+		scopeChecks:    map[string][]domain.ScopeCheckRecord{},
+		approvals:      map[string]domain.Approval{},
+		toolCalls:      []domain.ToolCall{},
+		mcpSessions:    map[string]domain.MCPSession{},
+		mcpEvents:      map[string][]domain.MCPSessionEvent{},
+		auditLogs:      []domain.AuditLog{},
+		nextEventID:    1,
 	}
-	s.seed()
+	s.seed(adminEmail, adminPassword)
 	return s
 }
 
-func (s *MemoryStore) seed() {
+func (s *MemoryStore) seed(adminEmail string, adminPassword string) {
 	now := time.Now().UTC()
+	if adminEmail == "" {
+		adminEmail = "local-dev@multi-codex.invalid"
+	}
+	if adminPassword == "" {
+		adminPassword = "admin123"
+	}
 	user := domain.User{
 		ID:          "user_local_dev",
-		Email:       "local-dev@multi-codex.invalid",
+		Email:       adminEmail,
 		DisplayName: "Local Developer",
 		CreatedAt:   now,
 	}
@@ -86,9 +106,10 @@ func (s *MemoryStore) seed() {
 		CreatedAt: now,
 	}
 	s.auth = domain.AuthContext{
-		User:        user,
-		Membership:  membership,
-		Permissions: []string{"*"},
+		User:               user,
+		Membership:         membership,
+		ProjectMemberships: []domain.ProjectMembership{},
+		Permissions:        []string{"*"},
 	}
 	org := domain.Organization{
 		ID:        membership.OrgID,
@@ -114,7 +135,24 @@ func (s *MemoryStore) seed() {
 		CreatedAt:     now,
 	}
 	s.organizations[org.ID] = org
+	s.users[user.ID] = user
+	if passwordHash, err := authn.HashPassword(adminPassword); err == nil {
+		s.passwords[user.ID] = passwordHash
+	}
+	s.memberships[membershipKey(membership.OrgID, membership.UserID)] = membership
 	s.projects[project.ID] = project
+	projectMembership := domain.ProjectMembership{
+		ProjectID:   project.ID,
+		UserID:      user.ID,
+		Role:        "owner",
+		ProjectName: project.Name,
+		ProjectSlug: project.Slug,
+		UserEmail:   user.Email,
+		UserName:    user.DisplayName,
+		CreatedAt:   now,
+	}
+	s.projectMembers[projectMembershipKey(project.ID, user.ID)] = projectMembership
+	s.auth.ProjectMemberships = []domain.ProjectMembership{projectMembership}
 	s.repositories[repo.ID] = repo
 	for _, seed := range seedSkillVersions(now) {
 		s.skills[seed.Skill.ID] = seed.Skill
@@ -139,7 +177,10 @@ func (s *MemoryStore) GetAuthContext() domain.AuthContext {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.auth
+	auth := s.auth
+	auth.ProjectMemberships = s.projectMembershipsForUserLocked(auth.User.ID)
+	auth.Permissions = permissionsForAuth(auth.Membership.Role, auth.ProjectMemberships)
+	return auth
 }
 
 func (s *MemoryStore) UpsertExternalUser(provider string, subject string, email string, displayName string, role string, orgID string) (domain.AuthContext, error) {
@@ -175,10 +216,12 @@ func (s *MemoryStore) UpsertExternalUser(provider string, subject string, email 
 	}
 	auth := domain.AuthContext{
 		User: domain.User{
-			ID:          userID,
-			Email:       email,
-			DisplayName: displayName,
-			CreatedAt:   createdAt,
+			ID:               userID,
+			Email:            email,
+			DisplayName:      displayName,
+			ExternalProvider: provider,
+			ExternalSubject:  subject,
+			CreatedAt:        createdAt,
 		},
 		Membership: domain.Membership{
 			OrgID:     orgID,
@@ -186,9 +229,12 @@ func (s *MemoryStore) UpsertExternalUser(provider string, subject string, email 
 			Role:      role,
 			CreatedAt: now,
 		},
-		Permissions: PermissionsForRole(role),
 	}
+	auth.ProjectMemberships = s.projectMembershipsForUserLocked(userID)
+	auth.Permissions = permissionsForAuth(role, auth.ProjectMemberships)
 	s.externalUsers[key] = auth
+	s.users[userID] = auth.User
+	s.memberships[membershipKey(orgID, userID)] = auth.Membership
 	return auth, nil
 }
 
@@ -428,6 +474,137 @@ func (s *MemoryStore) CleanupAuthLoginStates(cutoff time.Time, dryRun bool) (dom
 	return result, nil
 }
 
+func (s *MemoryStore) ListUsers(orgID string) []domain.User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	users := []domain.User{}
+	for _, membership := range s.memberships {
+		if orgID != "" && membership.OrgID != orgID {
+			continue
+		}
+		user, ok := s.users[membership.UserID]
+		if ok {
+			users = append(users, user)
+		}
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].Email < users[j].Email })
+	return users
+}
+
+func (s *MemoryStore) GetUserByEmail(email string) (domain.AuthContext, string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, user := range s.users {
+		if !strings.EqualFold(user.Email, strings.TrimSpace(email)) {
+			continue
+		}
+		var membership domain.Membership
+		for _, candidate := range s.memberships {
+			if candidate.UserID == user.ID {
+				membership = candidate
+				break
+			}
+		}
+		if membership.UserID == "" {
+			return domain.AuthContext{}, "", ErrNotFound
+		}
+		projectMemberships := s.projectMembershipsForUserLocked(user.ID)
+		return domain.AuthContext{
+			User:               user,
+			Membership:         membership,
+			ProjectMemberships: projectMemberships,
+			Permissions:        permissionsForAuth(membership.Role, projectMemberships),
+		}, s.passwords[user.ID], nil
+	}
+	return domain.AuthContext{}, "", ErrNotFound
+}
+
+func (s *MemoryStore) SetUserPassword(userID string, passwordHash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if userID == "" || passwordHash == "" {
+		return errors.New("user_id and password hash are required")
+	}
+	if _, ok := s.users[userID]; !ok {
+		return ErrNotFound
+	}
+	s.passwords[userID] = passwordHash
+	return nil
+}
+
+func (s *MemoryStore) ListMemberships(orgID string) []domain.Membership {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	memberships := []domain.Membership{}
+	for _, membership := range s.memberships {
+		if orgID == "" || membership.OrgID == orgID {
+			memberships = append(memberships, membership)
+		}
+	}
+	sort.Slice(memberships, func(i, j int) bool {
+		if memberships[i].Role == memberships[j].Role {
+			return memberships[i].UserID < memberships[j].UserID
+		}
+		return memberships[i].Role < memberships[j].Role
+	})
+	return memberships
+}
+
+func (s *MemoryStore) UpsertUser(user domain.User, orgID string, role string) (domain.AuthContext, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if user.Email == "" {
+		return domain.AuthContext{}, errors.New("email is required")
+	}
+	if user.DisplayName == "" {
+		user.DisplayName = user.Email
+	}
+	if orgID == "" {
+		orgID = s.auth.Membership.OrgID
+	}
+	if role == "" {
+		role = "viewer"
+	}
+	now := time.Now().UTC()
+	for _, existing := range s.users {
+		if existing.Email == user.Email {
+			user.ID = existing.ID
+			user.CreatedAt = existing.CreatedAt
+			if user.ExternalProvider == "" {
+				user.ExternalProvider = existing.ExternalProvider
+			}
+			if user.ExternalSubject == "" {
+				user.ExternalSubject = existing.ExternalSubject
+			}
+			break
+		}
+	}
+	if user.ID == "" {
+		user.ID = domain.NewID("user")
+		user.CreatedAt = now
+	}
+	if user.CreatedAt.IsZero() {
+		user.CreatedAt = now
+	}
+	s.users[user.ID] = user
+	membership := domain.Membership{OrgID: orgID, UserID: user.ID, Role: role, CreatedAt: now}
+	if existing, ok := s.memberships[membershipKey(orgID, user.ID)]; ok {
+		membership.CreatedAt = existing.CreatedAt
+	}
+	s.memberships[membershipKey(orgID, user.ID)] = membership
+	return domain.AuthContext{
+		User:               user,
+		Membership:         membership,
+		ProjectMemberships: s.projectMembershipsForUserLocked(user.ID),
+		Permissions:        permissionsForAuth(role, s.projectMembershipsForUserLocked(user.ID)),
+	}, nil
+}
+
 func (s *MemoryStore) ListOrganizations() []domain.Organization {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -495,6 +672,55 @@ func (s *MemoryStore) GetProject(id string) (domain.Project, error) {
 		return domain.Project{}, ErrNotFound
 	}
 	return project, nil
+}
+
+func (s *MemoryStore) ListProjectMemberships(projectID string) []domain.ProjectMembership {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	memberships := []domain.ProjectMembership{}
+	for _, membership := range s.projectMembers {
+		if projectID == "" || membership.ProjectID == projectID {
+			memberships = append(memberships, s.hydrateProjectMembershipLocked(membership))
+		}
+	}
+	sort.Slice(memberships, func(i, j int) bool { return memberships[i].UserEmail < memberships[j].UserEmail })
+	return memberships
+}
+
+func (s *MemoryStore) ListProjectMembershipsForUser(userID string) []domain.ProjectMembership {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.projectMembershipsForUserLocked(userID)
+}
+
+func (s *MemoryStore) UpsertProjectMembership(membership domain.ProjectMembership) (domain.ProjectMembership, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if membership.ProjectID == "" || membership.UserID == "" {
+		return domain.ProjectMembership{}, errors.New("project_id and user_id are required")
+	}
+	if _, ok := s.projects[membership.ProjectID]; !ok {
+		return domain.ProjectMembership{}, ErrNotFound
+	}
+	if _, ok := s.users[membership.UserID]; !ok {
+		return domain.ProjectMembership{}, ErrNotFound
+	}
+	if membership.Role == "" {
+		membership.Role = "viewer"
+	}
+	key := projectMembershipKey(membership.ProjectID, membership.UserID)
+	if existing, ok := s.projectMembers[key]; ok {
+		membership.CreatedAt = existing.CreatedAt
+	}
+	if membership.CreatedAt.IsZero() {
+		membership.CreatedAt = time.Now().UTC()
+	}
+	membership = s.hydrateProjectMembershipLocked(membership)
+	s.projectMembers[key] = membership
+	return membership, nil
 }
 
 func (s *MemoryStore) ListRepositories(projectID string) []domain.Repository {
@@ -1419,4 +1645,35 @@ func (s *MemoryStore) appendEventLocked(runID string, level string, eventType st
 	s.nextEventID++
 	s.events[runID] = append(s.events[runID], event)
 	return event
+}
+
+func (s *MemoryStore) projectMembershipsForUserLocked(userID string) []domain.ProjectMembership {
+	memberships := []domain.ProjectMembership{}
+	for _, membership := range s.projectMembers {
+		if membership.UserID == userID {
+			memberships = append(memberships, s.hydrateProjectMembershipLocked(membership))
+		}
+	}
+	sort.Slice(memberships, func(i, j int) bool { return memberships[i].ProjectName < memberships[j].ProjectName })
+	return memberships
+}
+
+func (s *MemoryStore) hydrateProjectMembershipLocked(membership domain.ProjectMembership) domain.ProjectMembership {
+	if project, ok := s.projects[membership.ProjectID]; ok {
+		membership.ProjectName = project.Name
+		membership.ProjectSlug = project.Slug
+	}
+	if user, ok := s.users[membership.UserID]; ok {
+		membership.UserEmail = user.Email
+		membership.UserName = user.DisplayName
+	}
+	return membership
+}
+
+func membershipKey(orgID string, userID string) string {
+	return orgID + ":" + userID
+}
+
+func projectMembershipKey(projectID string, userID string) string {
+	return projectID + ":" + userID
 }

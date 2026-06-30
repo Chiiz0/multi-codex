@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/Chiiz0/multi-codex/internal/config"
+
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -15,9 +17,14 @@ type RuntimeStore struct {
 }
 
 func Open(ctx context.Context, databaseURL string, log *slog.Logger) (RuntimeStore, error) {
+	return OpenWithConfig(ctx, config.Config{DatabaseURL: databaseURL}, log)
+}
+
+func OpenWithConfig(ctx context.Context, cfg config.Config, log *slog.Logger) (RuntimeStore, error) {
+	databaseURL := cfg.DatabaseURL
 	if databaseURL == "" {
 		log.Info("using in-memory store")
-		return RuntimeStore{Store: NewMemoryStore(), Close: func() error { return nil }}, nil
+		return RuntimeStore{Store: NewMemoryStoreWithSeed(cfg.LocalAdminEmail, cfg.LocalAdminPassword), Close: func() error { return nil }}, nil
 	}
 
 	db, err := sql.Open("pgx", databaseURL)
@@ -36,7 +43,7 @@ func Open(ctx context.Context, databaseURL string, log *slog.Logger) (RuntimeSto
 	}
 
 	pg := NewPostgresStore(db, log, databaseURL)
-	if err := pg.EnsureSeed(ctx); err != nil {
+	if err := pg.EnsureSeedWithCredentials(ctx, cfg.LocalAdminEmail, cfg.LocalAdminPassword); err != nil {
 		_ = db.Close()
 		return RuntimeStore{}, err
 	}

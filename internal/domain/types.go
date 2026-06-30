@@ -35,10 +35,12 @@ type Repository struct {
 }
 
 type User struct {
-	ID          string    `json:"id"`
-	Email       string    `json:"email"`
-	DisplayName string    `json:"display_name"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID               string    `json:"id"`
+	Email            string    `json:"email"`
+	DisplayName      string    `json:"display_name"`
+	ExternalProvider string    `json:"external_provider,omitempty"`
+	ExternalSubject  string    `json:"external_subject,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type Membership struct {
@@ -48,10 +50,22 @@ type Membership struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type ProjectMembership struct {
+	ProjectID   string    `json:"project_id"`
+	UserID      string    `json:"user_id"`
+	Role        string    `json:"role"`
+	ProjectName string    `json:"project_name,omitempty"`
+	ProjectSlug string    `json:"project_slug,omitempty"`
+	UserEmail   string    `json:"user_email,omitempty"`
+	UserName    string    `json:"user_name,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type AuthContext struct {
-	User        User       `json:"user"`
-	Membership  Membership `json:"membership"`
-	Permissions []string   `json:"permissions"`
+	User               User                `json:"user"`
+	Membership         Membership          `json:"membership"`
+	ProjectMemberships []ProjectMembership `json:"project_memberships"`
+	Permissions        []string            `json:"permissions"`
 }
 
 type Skill struct {

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -29,8 +30,193 @@ LIMIT 1`, defaultUserID).Scan(
 		auth.User = domain.User{ID: defaultUserID, Email: "local-dev@multi-codex.invalid", DisplayName: "Local Developer", CreatedAt: now}
 		auth.Membership = domain.Membership{OrgID: defaultOrgID, UserID: defaultUserID, Role: "owner", CreatedAt: now}
 	}
-	auth.Permissions = permissionsForRole(auth.Membership.Role)
+	auth.ProjectMemberships = s.listProjectMembershipsForUser(ctx, auth.User.ID)
+	auth.Permissions = permissionsForAuth(auth.Membership.Role, auth.ProjectMemberships)
 	return auth
+}
+
+func (s *PostgresStore) ListUsers(orgID string) []domain.User {
+	if orgID != "" && !validUUIDText(orgID) {
+		return []domain.User{}
+	}
+	ctx, cancel := storeContext()
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT DISTINCT u.id::text, u.email, u.display_name, COALESCE(u.external_provider, ''), COALESCE(u.external_subject, ''), u.created_at
+FROM users u
+JOIN memberships m ON m.user_id = u.id
+WHERE ($1 = '' OR m.org_id = $1::uuid)
+ORDER BY u.email ASC`, orgID)
+	if err != nil {
+		s.log.Error("list users failed", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	users := []domain.User{}
+	for rows.Next() {
+		user, err := scanUser(rows)
+		if err != nil {
+			s.log.Error("scan user failed", "error", err)
+			return users
+		}
+		users = append(users, user)
+	}
+	return users
+}
+
+func (s *PostgresStore) ListMemberships(orgID string) []domain.Membership {
+	if orgID != "" && !validUUIDText(orgID) {
+		return []domain.Membership{}
+	}
+	ctx, cancel := storeContext()
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT org_id::text, user_id::text, role, created_at
+FROM memberships
+WHERE ($1 = '' OR org_id = $1::uuid)
+ORDER BY created_at ASC`, orgID)
+	if err != nil {
+		s.log.Error("list memberships failed", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	memberships := []domain.Membership{}
+	for rows.Next() {
+		var membership domain.Membership
+		if err := rows.Scan(&membership.OrgID, &membership.UserID, &membership.Role, &membership.CreatedAt); err != nil {
+			s.log.Error("scan membership failed", "error", err)
+			return memberships
+		}
+		memberships = append(memberships, membership)
+	}
+	return memberships
+}
+
+func (s *PostgresStore) GetUserByEmail(email string) (domain.AuthContext, string, error) {
+	ctx, cancel := storeContext()
+	defer cancel()
+
+	var auth domain.AuthContext
+	var passwordHash string
+	err := s.db.QueryRowContext(ctx, `
+SELECT u.id::text, u.email, u.display_name, COALESCE(u.external_provider, ''), COALESCE(u.external_subject, ''), u.created_at,
+       m.org_id::text, m.user_id::text, m.role, m.created_at,
+       COALESCE(c.password_hash, '')
+FROM users u
+JOIN memberships m ON m.user_id = u.id
+LEFT JOIN user_password_credentials c ON c.user_id = u.id
+WHERE lower(u.email) = lower($1)
+ORDER BY m.created_at ASC
+LIMIT 1`, email).Scan(
+		&auth.User.ID, &auth.User.Email, &auth.User.DisplayName, &auth.User.ExternalProvider, &auth.User.ExternalSubject, &auth.User.CreatedAt,
+		&auth.Membership.OrgID, &auth.Membership.UserID, &auth.Membership.Role, &auth.Membership.CreatedAt,
+		&passwordHash,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.AuthContext{}, "", ErrNotFound
+	}
+	if err != nil {
+		return domain.AuthContext{}, "", err
+	}
+	auth.ProjectMemberships = s.listProjectMembershipsForUser(ctx, auth.User.ID)
+	auth.Permissions = permissionsForAuth(auth.Membership.Role, auth.ProjectMemberships)
+	return auth, passwordHash, nil
+}
+
+func (s *PostgresStore) SetUserPassword(userID string, passwordHash string) error {
+	if !validUUIDText(userID) {
+		return ErrInvalidID
+	}
+	ctx, cancel := storeContext()
+	defer cancel()
+
+	result, err := s.db.ExecContext(ctx, `
+INSERT INTO user_password_credentials (user_id, password_hash, updated_at)
+VALUES ($1::uuid, $2, now())
+ON CONFLICT (user_id) DO UPDATE
+SET password_hash = EXCLUDED.password_hash,
+    updated_at = now()`, userID, passwordHash)
+	if err != nil {
+		return err
+	}
+	if affected, _ := result.RowsAffected(); affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *PostgresStore) UpsertUser(user domain.User, orgID string, role string) (domain.AuthContext, error) {
+	ctx, cancel := storeContext()
+	defer cancel()
+
+	if user.Email == "" {
+		return domain.AuthContext{}, errors.New("email is required")
+	}
+	if user.DisplayName == "" {
+		user.DisplayName = user.Email
+	}
+	if user.ExternalProvider == "" {
+		user.ExternalProvider = "local"
+	}
+	if role == "" {
+		role = "viewer"
+	}
+	if orgID == "" {
+		orgID = defaultOrgID
+	}
+	if !validUUIDText(orgID) {
+		return domain.AuthContext{}, ErrInvalidID
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.AuthContext{}, err
+	}
+	defer tx.Rollback()
+
+	var auth domain.AuthContext
+	if user.ExternalSubject != "" {
+		err = tx.QueryRowContext(ctx, `
+INSERT INTO users (email, display_name, external_provider, external_subject)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (external_provider, external_subject) WHERE external_subject IS NOT NULL
+DO UPDATE SET email = EXCLUDED.email,
+              display_name = EXCLUDED.display_name
+RETURNING id::text, email, display_name, COALESCE(external_provider, ''), COALESCE(external_subject, ''), created_at`,
+			user.Email, user.DisplayName, user.ExternalProvider, user.ExternalSubject,
+		).Scan(&auth.User.ID, &auth.User.Email, &auth.User.DisplayName, &auth.User.ExternalProvider, &auth.User.ExternalSubject, &auth.User.CreatedAt)
+	} else {
+		err = tx.QueryRowContext(ctx, `
+INSERT INTO users (email, display_name, external_provider)
+VALUES ($1, $2, $3)
+ON CONFLICT (email) DO UPDATE SET display_name = EXCLUDED.display_name
+RETURNING id::text, email, display_name, COALESCE(external_provider, ''), COALESCE(external_subject, ''), created_at`,
+			user.Email, user.DisplayName, user.ExternalProvider,
+		).Scan(&auth.User.ID, &auth.User.Email, &auth.User.DisplayName, &auth.User.ExternalProvider, &auth.User.ExternalSubject, &auth.User.CreatedAt)
+	}
+	if err != nil {
+		return domain.AuthContext{}, err
+	}
+
+	if err := tx.QueryRowContext(ctx, `
+INSERT INTO memberships (org_id, user_id, role)
+VALUES ($1::uuid, $2::uuid, $3)
+ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role
+RETURNING org_id::text, user_id::text, role, created_at`,
+		orgID, auth.User.ID, role,
+	).Scan(&auth.Membership.OrgID, &auth.Membership.UserID, &auth.Membership.Role, &auth.Membership.CreatedAt); err != nil {
+		return domain.AuthContext{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.AuthContext{}, err
+	}
+	auth.ProjectMemberships = s.listProjectMembershipsForUser(ctx, auth.User.ID)
+	auth.Permissions = permissionsForAuth(auth.Membership.Role, auth.ProjectMemberships)
+	return auth, nil
 }
 
 func (s *PostgresStore) ListOrganizations() []domain.Organization {
@@ -112,9 +298,9 @@ VALUES ($1, $2, $3, $4)
 ON CONFLICT (external_provider, external_subject) WHERE external_subject IS NOT NULL
 DO UPDATE SET email = EXCLUDED.email,
               display_name = EXCLUDED.display_name
-RETURNING id::text, email, display_name, created_at`,
+RETURNING id::text, email, display_name, COALESCE(external_provider, ''), COALESCE(external_subject, ''), created_at`,
 		email, displayName, provider, subject,
-	).Scan(&auth.User.ID, &auth.User.Email, &auth.User.DisplayName, &auth.User.CreatedAt); err != nil {
+	).Scan(&auth.User.ID, &auth.User.Email, &auth.User.DisplayName, &auth.User.ExternalProvider, &auth.User.ExternalSubject, &auth.User.CreatedAt); err != nil {
 		return domain.AuthContext{}, err
 	}
 
@@ -130,8 +316,110 @@ RETURNING org_id::text, user_id::text, role, created_at`,
 	if err := tx.Commit(); err != nil {
 		return domain.AuthContext{}, err
 	}
-	auth.Permissions = PermissionsForRole(auth.Membership.Role)
+	auth.ProjectMemberships = s.listProjectMembershipsForUser(ctx, auth.User.ID)
+	auth.Permissions = permissionsForAuth(auth.Membership.Role, auth.ProjectMemberships)
 	return auth, nil
+}
+
+func (s *PostgresStore) ListProjectMemberships(projectID string) []domain.ProjectMembership {
+	if projectID != "" && !validUUIDText(projectID) {
+		return []domain.ProjectMembership{}
+	}
+	ctx, cancel := storeContext()
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, `
+SELECT pm.project_id::text, pm.user_id::text, pm.role, p.name, p.slug, u.email, u.display_name, pm.created_at
+FROM project_memberships pm
+JOIN projects p ON p.id = pm.project_id
+JOIN users u ON u.id = pm.user_id
+WHERE ($1 = '' OR pm.project_id = $1::uuid)
+ORDER BY p.name ASC, u.email ASC`, projectID)
+	if err != nil {
+		s.log.Error("list project memberships failed", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	memberships := []domain.ProjectMembership{}
+	for rows.Next() {
+		membership, err := scanProjectMembership(rows)
+		if err != nil {
+			s.log.Error("scan project membership failed", "error", err)
+			return memberships
+		}
+		memberships = append(memberships, membership)
+	}
+	return memberships
+}
+
+func (s *PostgresStore) ListProjectMembershipsForUser(userID string) []domain.ProjectMembership {
+	if userID != "" && !validUUIDText(userID) {
+		return []domain.ProjectMembership{}
+	}
+	ctx, cancel := storeContext()
+	defer cancel()
+	return s.listProjectMembershipsForUser(ctx, userID)
+}
+
+func (s *PostgresStore) UpsertProjectMembership(membership domain.ProjectMembership) (domain.ProjectMembership, error) {
+	if !validUUIDText(membership.ProjectID) || !validUUIDText(membership.UserID) {
+		return domain.ProjectMembership{}, ErrInvalidID
+	}
+	if membership.Role == "" {
+		membership.Role = "viewer"
+	}
+	ctx, cancel := storeContext()
+	defer cancel()
+
+	row := s.db.QueryRowContext(ctx, `
+WITH upserted AS (
+  INSERT INTO project_memberships (project_id, user_id, role)
+  VALUES ($1::uuid, $2::uuid, $3)
+  ON CONFLICT (project_id, user_id) DO UPDATE SET role = EXCLUDED.role
+  RETURNING project_id, user_id, role, created_at
+)
+SELECT upserted.project_id::text, upserted.user_id::text, upserted.role,
+       p.name, p.slug, u.email, u.display_name, upserted.created_at
+FROM upserted
+JOIN projects p ON p.id = upserted.project_id
+JOIN users u ON u.id = upserted.user_id`,
+		membership.ProjectID, membership.UserID, membership.Role,
+	)
+	membership, err := scanProjectMembership(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ProjectMembership{}, ErrNotFound
+	}
+	return membership, err
+}
+
+func (s *PostgresStore) listProjectMembershipsForUser(ctx context.Context, userID string) []domain.ProjectMembership {
+	if userID == "" || !validUUIDText(userID) {
+		return []domain.ProjectMembership{}
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT pm.project_id::text, pm.user_id::text, pm.role, p.name, p.slug, u.email, u.display_name, pm.created_at
+FROM project_memberships pm
+JOIN projects p ON p.id = pm.project_id
+JOIN users u ON u.id = pm.user_id
+WHERE pm.user_id = $1::uuid
+ORDER BY p.name ASC`, userID)
+	if err != nil {
+		s.log.Error("list user project memberships failed", "error", err)
+		return nil
+	}
+	defer rows.Close()
+
+	memberships := []domain.ProjectMembership{}
+	for rows.Next() {
+		membership, err := scanProjectMembership(rows)
+		if err != nil {
+			s.log.Error("scan user project membership failed", "error", err)
+			return memberships
+		}
+		memberships = append(memberships, membership)
+	}
+	return memberships
 }
 
 func (s *PostgresStore) RevokeAuthToken(revocation domain.AuthTokenRevocation) (domain.AuthTokenRevocation, error) {
@@ -261,7 +549,8 @@ LIMIT 1`, tokenHash, now.UTC()).Scan(
 		return domain.AuthContext{}, domain.AuthSession{}, err
 	}
 	session.LastSeenAt = now.UTC()
-	auth.Permissions = PermissionsForRole(auth.Membership.Role)
+	auth.ProjectMemberships = s.listProjectMembershipsForUser(ctx, auth.User.ID)
+	auth.Permissions = permissionsForAuth(auth.Membership.Role, auth.ProjectMemberships)
 	return auth, session, nil
 }
 
@@ -966,6 +1255,33 @@ func scanAgentProfile(row rowScanner) (domain.AgentProfile, error) {
 	return profile, nil
 }
 
+func scanUser(row rowScanner) (domain.User, error) {
+	var user domain.User
+	err := row.Scan(&user.ID, &user.Email, &user.DisplayName, &user.ExternalProvider, &user.ExternalSubject, &user.CreatedAt)
+	if err != nil {
+		return domain.User{}, err
+	}
+	return user, nil
+}
+
+func scanProjectMembership(row rowScanner) (domain.ProjectMembership, error) {
+	var membership domain.ProjectMembership
+	err := row.Scan(
+		&membership.ProjectID,
+		&membership.UserID,
+		&membership.Role,
+		&membership.ProjectName,
+		&membership.ProjectSlug,
+		&membership.UserEmail,
+		&membership.UserName,
+		&membership.CreatedAt,
+	)
+	if err != nil {
+		return domain.ProjectMembership{}, err
+	}
+	return membership, nil
+}
+
 func scanExecutorNode(row rowScanner) (domain.ExecutorNode, error) {
 	var node domain.ExecutorNode
 	var labelsBytes []byte
@@ -1073,6 +1389,23 @@ func permissionsForRole(role string) []string {
 	return PermissionsForRole(role)
 }
 
+func permissionsForAuth(orgRole string, projectMemberships []domain.ProjectMembership) []string {
+	values := map[string]struct{}{}
+	for _, permission := range PermissionsForRole(orgRole) {
+		values[permission] = struct{}{}
+	}
+	for _, membership := range projectMemberships {
+		for _, permission := range PermissionsForProjectRole(membership.Role) {
+			values[permission] = struct{}{}
+		}
+	}
+	permissions := make([]string, 0, len(values))
+	for permission := range values {
+		permissions = append(permissions, permission)
+	}
+	return permissions
+}
+
 func PermissionsForRole(role string) []string {
 	switch role {
 	case "owner", "admin":
@@ -1087,5 +1420,22 @@ func PermissionsForRole(role string) []string {
 		return []string{"organizations:read", "projects:read", "tasks:read", "runs:read", "nodes:read", "audit:read"}
 	default:
 		return []string{"organizations:read", "projects:read", "tasks:read", "runs:read"}
+	}
+}
+
+func PermissionsForProjectRole(role string) []string {
+	switch role {
+	case "owner", "project_admin":
+		return []string{"projects:read", "projects:write", "repositories:write", "tasks:write", "runs:read", "runs:write", "approvals:write", "nodes:read", "skills:write", "audit:read"}
+	case "maintainer":
+		return []string{"projects:read", "repositories:write", "tasks:write", "runs:read", "runs:write", "approvals:write", "nodes:read", "audit:read"}
+	case "developer":
+		return []string{"projects:read", "tasks:write", "runs:read", "runs:write", "nodes:read"}
+	case "reviewer":
+		return []string{"projects:read", "tasks:read", "runs:read", "approvals:write", "nodes:read", "audit:read"}
+	case "auditor":
+		return []string{"projects:read", "tasks:read", "runs:read", "nodes:read", "audit:read"}
+	default:
+		return []string{"projects:read", "tasks:read", "runs:read"}
 	}
 }

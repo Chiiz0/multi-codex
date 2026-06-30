@@ -21,7 +21,7 @@ func main() {
 		log.Error("production configuration rejected", "error", err)
 		os.Exit(1)
 	}
-	runtimeStore, err := store.Open(context.Background(), cfg.DatabaseURL, log)
+	runtimeStore, err := store.OpenWithConfig(context.Background(), cfg, log)
 	if err != nil {
 		log.Error("open store failed", "error", err)
 		os.Exit(1)

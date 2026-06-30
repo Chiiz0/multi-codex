@@ -18,8 +18,10 @@ func TestGitPublishPRAuditsCredentialMetadata(t *testing.T) {
 	st := store.NewMemoryStore()
 	task := apiGitPublishReadyTask(t, st)
 	server := NewServer(config.Config{GitSyncMode: "dry-run"}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cookie := localSessionCookie(t, server.Handler())
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+task.ID+"/workflow/git_publish_pr", nil)
+	req.AddCookie(cookie)
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
 	if resp.Code != http.StatusCreated {
@@ -62,8 +64,10 @@ func TestGitPublishPRLiveCreatesProviderPRWithoutAutoMerge(t *testing.T) {
 		GitHubAPIURL: provider.URL,
 		GitHubToken:  "gh-live-token",
 	}, st, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cookie := localSessionCookie(t, server.Handler())
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/tasks/"+task.ID+"/workflow/git_publish_pr", nil)
+	req.AddCookie(cookie)
 	resp := httptest.NewRecorder()
 	server.Handler().ServeHTTP(resp, req)
 	if resp.Code != http.StatusCreated {
